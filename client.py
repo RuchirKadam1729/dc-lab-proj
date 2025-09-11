@@ -30,7 +30,7 @@ class ClientFunctions:
 import json
 
 
-# Work in Progress
+# Work in Progress - 80% done
 class WebSocketConn:
     def __init__(self, clientFuncs: ClientFunctions):
         self.clientFuncs = clientFuncs
