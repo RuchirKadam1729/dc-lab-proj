@@ -1,0 +1,2 @@
+python -m grpc_tools.protoc -I protos --python_out=./protogens --pyi_out=./protogens --grpc_python_out=./protogens pro
+tos/ChatServer.proto
