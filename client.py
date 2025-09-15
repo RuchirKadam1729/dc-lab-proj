@@ -12,70 +12,60 @@ from datetime import datetime
 class Client(BaseModel):
     id: str
     name: str = "Anonymous"
+    chatMessages: list[ChatMessage] = []  # maybe replaced by db later (shrugs)
+    v_clock: dict[str, int] = {}
+    date_time: datetime = datetime.now()
 
-    known_addrs: set[str]
-    chatMessages: list[ChatMessage]  # maybe replaced by db later (shrugs)
-    v_clock: dict[str, int]
-    date_time: datetime
+    async def receive(self, chatMessages: ChatMessage):
+        self.chatMessages.append(chatMessages)
 
+    async def produce(self):
+        to: str = input()
+        str_msg: str = input()
+        from datetime import datetime
 
-class ClientFunctions:
-    def __init__(self, client: Client):
-        self.client: Client = client
-
-    def receive(self, chatMessages: ChatMessage):
-        self.client.chatMessages.append(chatMessages)
-
-
-import json
-
-
-# Work in Progress - 80% done
-class WebSocketConn:
-    def __init__(self, clientFuncs: ClientFunctions):
-        self.clientFuncs = clientFuncs
-
-    async def consume(self, message: ChatMessage):
-        event = json.loads(message)
-        match event["invoke"]:
-            case "receive":
-                self.clientFuncs.receive(message)
-
-    async def produce(self, recipient_id, str_message) -> ChatMessage:
-        client = self.clientFuncs.client
         return ChatMessage(
-            sender_id=client.id,
-            recipient_id=recipient_id,
-            payload=str_message,
-            v_clock=client.v_clock,
-            date_time=client.date_time,
+            sender_id=self.id,
+            recipient_id=to,
+            payload=str_msg,
+            date_time=datetime.now(),
+            v_clock=self.v_clock,
         )
 
-    async def consumer_handler(self, websocket):
-        async for message in websocket:
-            await self.consume(message)
-
     async def producer_handler(self, websocket):
+        from websockets.exceptions import ConnectionClosed
+
         while True:
             try:
                 message = await self.produce()
                 await websocket.send(message)
-            except websockets.exceptions.ConnectionClosed:
+            except ConnectionClosed:
                 break
+
+    async def consume(self, message: ChatMessage):
+        self.chatMessages.append(message)
+
+    async def consumer_handler(self, websocket):
+        async for message in websocket:
+            await self.consume(message)
 
     async def handler(self, websocket):
         await asyncio.gather(
             self.consumer_handler(websocket), self.producer_handler(websocket)
         )
 
-        async with websockets.asyncio.server.serve(self.handler, "", 8001) as server:
-            await server.serve_forever()
+
+import sys
 
 
-def run():
-    client = Client(**{"id": "123", "name": "client1"})
+async def main():
+    client = Client(id=sys.argv[1])
+    server_addr = sys.argv[2]
+    from websockets.asyncio.client import connect
+
+    async with connect(server_addr) as ws:
+        await client.handler(ws)
 
 
 if __name__ == "__main__":
-    logging.basicConfig()
-    run()
+    asyncio.run(main())

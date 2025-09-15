@@ -1,22 +1,25 @@
 syntax = "proto3";
 import "google/protobuf/timestamp.proto";
 
-service ChatServer {
-    rpc Forward(ChatMessage) returns (ChatServerResponse);
-}
+service ChatServer { rpc Forward(ChatMessage) returns (ChatServerResponse); }
 
 message ChatMessage {
-    string sender_id = 1;
-    string recipient_id = 2;
-    repeated string payload = 3;
-    map<string,int32> v_clock = 4;
-    google.protobuf.Timestamp date_time = 5;
+  string msg_id = 1;
+  string sender_id = 2;
+  string recipient_id = 3;
+  repeated string payload = 4;
+  map<string, int32> v_clock = 5;
+  google.protobuf.Timestamp date_time = 6;
 }
 
 message ChatServerResponse {
-    enum status {OK=0;ERR=1;}; 
-    status status_code = 1; 
-    repeated string payload = 2;
-    map<string,int32> v_clock = 3;
-    google.protobuf.Timestamp date_time = 4;
+  string msg_id = 1;
+  enum status {
+    OK = 0;
+    ERR = 1;
+  };
+  status status_code = 2;
+  repeated string payload = 3;
+  map<string, int32> v_clock = 4;
+  google.protobuf.Timestamp date_time = 5;
 }

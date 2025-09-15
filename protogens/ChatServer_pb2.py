@@ -25,7 +25,7 @@ _sym_db = _symbol_database.Default()
 from google.protobuf import timestamp_pb2 as google_dot_protobuf_dot_timestamp__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x10\x43hatServer.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\xd0\x01\n\x0b\x43hatMessage\x12\x11\n\tsender_id\x18\x01 \x01(\t\x12\x14\n\x0crecipient_id\x18\x02 \x01(\t\x12\x0f\n\x07payload\x18\x03 \x03(\t\x12)\n\x07v_clock\x18\x04 \x03(\x0b\x32\x18.ChatMessage.VClockEntry\x12-\n\tdate_time\x18\x05 \x01(\x0b\x32\x1a.google.protobuf.Timestamp\x1a-\n\x0bVClockEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\x05:\x02\x38\x01\"\x81\x02\n\x12\x43hatServerResponse\x12/\n\x0bstatus_code\x18\x01 \x01(\x0e\x32\x1a.ChatServerResponse.status\x12\x0f\n\x07payload\x18\x02 \x03(\t\x12\x30\n\x07v_clock\x18\x03 \x03(\x0b\x32\x1f.ChatServerResponse.VClockEntry\x12-\n\tdate_time\x18\x04 \x01(\x0b\x32\x1a.google.protobuf.Timestamp\x1a-\n\x0bVClockEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\x05:\x02\x38\x01\"\x19\n\x06status\x12\x06\n\x02OK\x10\x00\x12\x07\n\x03\x45RR\x10\x01\x32:\n\nChatServer\x12,\n\x07\x46orward\x12\x0c.ChatMessage\x1a\x13.ChatServerResponseb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x10\x43hatServer.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\xe0\x01\n\x0b\x43hatMessage\x12\x0e\n\x06msg_id\x18\x01 \x01(\t\x12\x11\n\tsender_id\x18\x02 \x01(\t\x12\x14\n\x0crecipient_id\x18\x03 \x01(\t\x12\x0f\n\x07payload\x18\x04 \x03(\t\x12)\n\x07v_clock\x18\x05 \x03(\x0b\x32\x18.ChatMessage.VClockEntry\x12-\n\tdate_time\x18\x06 \x01(\x0b\x32\x1a.google.protobuf.Timestamp\x1a-\n\x0bVClockEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\x05:\x02\x38\x01\"\x91\x02\n\x12\x43hatServerResponse\x12\x0e\n\x06msg_id\x18\x01 \x01(\t\x12/\n\x0bstatus_code\x18\x02 \x01(\x0e\x32\x1a.ChatServerResponse.status\x12\x0f\n\x07payload\x18\x03 \x03(\t\x12\x30\n\x07v_clock\x18\x04 \x03(\x0b\x32\x1f.ChatServerResponse.VClockEntry\x12-\n\tdate_time\x18\x05 \x01(\x0b\x32\x1a.google.protobuf.Timestamp\x1a-\n\x0bVClockEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\x05:\x02\x38\x01\"\x19\n\x06status\x12\x06\n\x02OK\x10\x00\x12\x07\n\x03\x45RR\x10\x01\x32:\n\nChatServer\x12,\n\x07\x46orward\x12\x0c.ChatMessage\x1a\x13.ChatServerResponseb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -37,15 +37,15 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_CHATSERVERRESPONSE_VCLOCKENTRY']._loaded_options = None
   _globals['_CHATSERVERRESPONSE_VCLOCKENTRY']._serialized_options = b'8\001'
   _globals['_CHATMESSAGE']._serialized_start=54
-  _globals['_CHATMESSAGE']._serialized_end=262
-  _globals['_CHATMESSAGE_VCLOCKENTRY']._serialized_start=217
-  _globals['_CHATMESSAGE_VCLOCKENTRY']._serialized_end=262
-  _globals['_CHATSERVERRESPONSE']._serialized_start=265
-  _globals['_CHATSERVERRESPONSE']._serialized_end=522
-  _globals['_CHATSERVERRESPONSE_VCLOCKENTRY']._serialized_start=217
-  _globals['_CHATSERVERRESPONSE_VCLOCKENTRY']._serialized_end=262
-  _globals['_CHATSERVERRESPONSE_STATUS']._serialized_start=497
-  _globals['_CHATSERVERRESPONSE_STATUS']._serialized_end=522
-  _globals['_CHATSERVER']._serialized_start=524
-  _globals['_CHATSERVER']._serialized_end=582
+  _globals['_CHATMESSAGE']._serialized_end=278
+  _globals['_CHATMESSAGE_VCLOCKENTRY']._serialized_start=233
+  _globals['_CHATMESSAGE_VCLOCKENTRY']._serialized_end=278
+  _globals['_CHATSERVERRESPONSE']._serialized_start=281
+  _globals['_CHATSERVERRESPONSE']._serialized_end=554
+  _globals['_CHATSERVERRESPONSE_VCLOCKENTRY']._serialized_start=233
+  _globals['_CHATSERVERRESPONSE_VCLOCKENTRY']._serialized_end=278
+  _globals['_CHATSERVERRESPONSE_STATUS']._serialized_start=529
+  _globals['_CHATSERVERRESPONSE_STATUS']._serialized_end=554
+  _globals['_CHATSERVER']._serialized_start=556
+  _globals['_CHATSERVER']._serialized_end=614
 # @@protoc_insertion_point(module_scope)

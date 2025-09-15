@@ -1,21 +1,13 @@
 from protogens.ChatServer_pb2 import *
 from protogens.ChatServer_pb2_grpc import *
 import grpc
-from pydantic import BaseModel
 
-# if needed later lol
-# import ipaddress
-
-# class Address(BaseModel):
-#     ipaddr : ipaddress
-#     port : int
-
-known_addresses: set[str] = ("localhost:9001", "localhost:9002", "localhost:9003")
+known_servers = dict(
+    {"0.0.0.0:9001": "srv-A", "0.0.0.0:9002": "srv-B", "0.0.0.0:9003": "srv-C"}
+)
 
 
-class Client(BaseModel):
-    id: str
-    name: str = "Anonymous"
+from client import Client, ClientFunctions
 
 
 class MsgBufferNode:
@@ -60,7 +52,6 @@ class MsgBufferNode:
         b_key = (
             getattr(other.val, "sender_id", ""),
             getattr(other.val, "recipient_id", ""),
-            tuple(getattr(other.val, "payload", ())),
         )
         return a_key < b_key
 
@@ -77,37 +68,22 @@ class MsgBuffer:
         heapq.heappush(self.buf, MsgBufferNode(msg))
 
     def buffer_out(self) -> ChatMessage:
-        return heapq.heappop(self.buf)
+        return heapq.heappop(self.buf).val
 
 
 import json
+from SenderAsync import SenderAsync
 
 
 class ChatServer(ChatServerServicer):
 
-    def __init__(self, address):
-        self.client_list: set[str] = ()
-        self.address: str
-        self.msgBuffers: dict[str, MsgBuffer]  # map of client id to msgbuffer
+    def __init__(self, address, known_servers=[]):
+        self.msgBuffers: dict[str, MsgBuffer]
+        self.clients: dict[str, Client]
+        self.seen_msg_ids = list()
+        self.known_servers = known_servers
+        self.address = address
 
-    def Forward(self, request: ChatMessage, context):
-        if request.recipient_id in self.client_list:
-            # if connection active (logic ill put later)
-            boole = 1
-            if boole:
-                event = json.dumps(
-                    """{
-                    invoke: receive}"""
-                )
-                # send thru WS connection
-            else:
-                self.msgBuffers[request.recipient_id].buffer_in(request)
-            pass
-        else:
-            for address in known_addresses:
-                with grpc.insecure_channel(address) as channel:
-                    stub = ChatServerStub(channel)
-                    resp: ChatServerResponse = stub.Forward(ChatMessage(request))
-                    if resp.status_code == resp.OK:
-                        return resp.OK
-            return resp.ERR
+    
+    async def Forward(self, request, context):
+         
