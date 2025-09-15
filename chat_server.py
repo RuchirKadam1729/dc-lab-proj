@@ -1,5 +1,5 @@
 from protogens.ChatServer_pb2 import *
-from protogens.ChatServer_pb2_grpc import * # type: ignore
+from protogens.ChatServer_pb2_grpc import *  # type: ignore
 import grpc
 
 known_servers = dict(
@@ -72,11 +72,14 @@ import json
 from SenderAsync import SenderAsync
 
 from datetime import datetime
+from random import randint
+from bully_election import BullyElectionImpl
 
 
 class ChatServer(ChatServerServicer):
 
     def __init__(self, address, known_servers=[]):
+        self.id: str
         self.msgBuffers: dict[str, MsgBuffer]
         self.clients: dict[str, SenderAsync]
         self.seen_msg_ids = list()
@@ -84,6 +87,9 @@ class ChatServer(ChatServerServicer):
         self.address = address
         self.v_clock: dict[str, int] = {}
         self.date_time: datetime = datetime.now()
+        self.bully_election_impl: BullyElectionImpl = BullyElectionImpl(
+            id=self.id, priority=randint(1, 9), known_servers=known_servers
+        )
 
     async def Forward(self, request: ChatMessage, context=None):
         for key, value in request.v_clock.items():
@@ -118,3 +124,25 @@ class ChatServer(ChatServerServicer):
                 continue
         self.msgBuffers[request.recipient_id].buffer_in(request)
         return "QUEUED_FALLBACK"
+
+    async def handler(self, websocket):
+        while 1:
+            pass
+
+
+import asyncio, websockets
+from websockets.asyncio.server import serve
+
+
+async def main():
+    import sys
+
+    cs = ChatServer("0.0.0.0:" + sys.argv[1])
+
+    asyncio.run(cs.bully_election_impl.LifeCycle())
+    async with serve(cs.handler, "0.0.0.0", int(sys.argv[1])) as ws:
+        await ws.serve_forever()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

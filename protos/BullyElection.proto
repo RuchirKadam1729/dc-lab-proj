@@ -1,0 +1,12 @@
+syntax = "proto3";
+service BullyElection {
+    rpc Election(ElectionMessage) returns (CandidateMessage);
+    rpc Leader(LeaderMessage) returns (ResponseMessage);
+    rpc Request(RequestMessage) returns (ResponseMessage);
+}
+
+message RequestMessage {}
+message ResponseMessage {int32 priority = 1;}
+message ElectionMessage {}
+message CandidateMessage {int32 priority = 1;}
+message LeaderMessage {string leader_id = 1;}
