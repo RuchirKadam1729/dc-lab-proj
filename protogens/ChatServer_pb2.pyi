@@ -11,9 +11,9 @@ from typing import ClassVar as _ClassVar, Optional as _Optional, Union as _Union
 DESCRIPTOR: _descriptor.FileDescriptor
 
 class ChatMessage(_message.Message):
-    __slots__ = ("msg_id", "sender_id", "recipient_id", "payload", "v_clock", "date_time")
+    __slots__ = ("msg_id", "sender_id", "recipient_id", "payload", "v_clock", "date_time") # type: ignore
     class VClockEntry(_message.Message):
-        __slots__ = ("key", "value")
+        __slots__ = ("key", "value") # type: ignore
         KEY_FIELD_NUMBER: _ClassVar[int]
         VALUE_FIELD_NUMBER: _ClassVar[int]
         key: str
@@ -34,7 +34,7 @@ class ChatMessage(_message.Message):
     def __init__(self, msg_id: _Optional[str] = ..., sender_id: _Optional[str] = ..., recipient_id: _Optional[str] = ..., payload: _Optional[_Iterable[str]] = ..., v_clock: _Optional[_Mapping[str, int]] = ..., date_time: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ...) -> None: ...
 
 class ChatServerResponse(_message.Message):
-    __slots__ = ("msg_id", "status_code", "payload", "v_clock", "date_time")
+    __slots__ = ("msg_id", "status_code", "payload", "v_clock", "date_time") # pyright: ignore[reportAssignmentType]
     class status(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
         __slots__ = ()
         OK: _ClassVar[ChatServerResponse.status]
@@ -42,7 +42,7 @@ class ChatServerResponse(_message.Message):
     OK: ChatServerResponse.status
     ERR: ChatServerResponse.status
     class VClockEntry(_message.Message):
-        __slots__ = ("key", "value")
+        __slots__ = ("key", "value") # pyright: ignore[reportAssignmentType]
         KEY_FIELD_NUMBER: _ClassVar[int]
         VALUE_FIELD_NUMBER: _ClassVar[int]
         key: str
