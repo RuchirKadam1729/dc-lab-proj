@@ -1,13 +1,10 @@
 from protogens.ChatServer_pb2 import *
-from protogens.ChatServer_pb2_grpc import *
+from protogens.ChatServer_pb2_grpc import * # type: ignore
 import grpc
 
 known_servers = dict(
     {"0.0.0.0:9001": "srv-A", "0.0.0.0:9002": "srv-B", "0.0.0.0:9003": "srv-C"}
 )
-
-
-from client import Client, ClientFunctions
 
 
 class MsgBufferNode:
@@ -74,16 +71,50 @@ class MsgBuffer:
 import json
 from SenderAsync import SenderAsync
 
+from datetime import datetime
+
 
 class ChatServer(ChatServerServicer):
 
     def __init__(self, address, known_servers=[]):
         self.msgBuffers: dict[str, MsgBuffer]
-        self.clients: dict[str, Client]
+        self.clients: dict[str, SenderAsync]
         self.seen_msg_ids = list()
         self.known_servers = known_servers
         self.address = address
+        self.v_clock: dict[str, int] = {}
+        self.date_time: datetime = datetime.now()
 
-    
-    async def Forward(self, request, context):
-         
+    async def Forward(self, request: ChatMessage, context=None):
+        for key, value in request.v_clock.items():
+            self.v_clock[key] = max(self.v_clock.get(key, 0), value)
+        for key in request.v_clock.keys():
+            request.v_clock[key] = self.v_clock[key]
+
+        # might still be buggy :/
+        if request.msg_id in self.seen_msg_ids:
+            return "DUP"
+        self.seen_msg_ids.append(request.msg_id)
+
+        sender = self.clients.get(request.recipient_id)
+        if sender:
+            sender.send(request.SerializeToString())
+            return "DELIVERED_LOCAL"
+
+        if request.recipient_id in self.clients:
+            self.msgBuffers[request.recipient_id].buffer_in(request)
+            return "QUEUED_LOCAL"
+
+        for addr in self.known_servers:
+            try:
+                async with grpc.aio.insecure_channel(addr) as ch:
+                    stub = ChatServerStub(ch)
+                    resp: ChatServerResponse = await stub.Forward(request)
+                    if resp.status_code == resp.OK:
+                        return "DELIVERED_REMOTE"
+                    if resp.status_code == resp.ERR:
+                        return "QUEUED_REMOTE"
+            except Exception:
+                continue
+        self.msgBuffers[request.recipient_id].buffer_in(request)
+        return "QUEUED_FALLBACK"
