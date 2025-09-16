@@ -15,8 +15,12 @@ message ChatMessage {
 message ChatServerResponse {
   string msg_id = 1;
   enum status {
-    OK = 0;
-    ERR = 1;
+    DUP = 0;
+    DELIVERED_LOCAL = 1;
+    QUEUED_LOCAL = 2;
+    DELIVERED_REMOTE = 3;
+    QUEUED_REMOTE = 4;
+    QUEUED_FALLBACK = 5;
   };
   status status_code = 2;
   repeated string payload = 3;

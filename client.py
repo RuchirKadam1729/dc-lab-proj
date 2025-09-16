@@ -23,8 +23,8 @@ class Client:
         self.chatMessages.append(chatMessages)
 
     async def produce(self):
-        to: str = input()
-        str_msg: str = input()
+        to: str = await asyncio.to_thread(input, "to: ")
+        str_msg: str = await asyncio.to_thread(input, "msg: ")
         from datetime import datetime
 
         return ChatMessage(
@@ -47,6 +47,7 @@ class Client:
 
     async def consume(self, message: ChatMessage):
         self.chatMessages.append(message)
+        print("Received message:", message)
 
     async def consumer_handler(self, websocket):
         async for message in websocket:
