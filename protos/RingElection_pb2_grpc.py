@@ -3,7 +3,7 @@
 import grpc
 import warnings
 
-import RingElection_pb2 as RingElection__pb2
+from . import RingElection_pb2 as RingElection__pb2
 
 GRPC_GENERATED_VERSION = '1.74.0'
 GRPC_VERSION = grpc.__version__

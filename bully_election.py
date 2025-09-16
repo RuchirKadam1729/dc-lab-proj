@@ -1,17 +1,19 @@
 # from chat_server import known_servers
 from protos.BullyElection_pb2 import *
 from protos.BullyElection_pb2_grpc import *
-from pydantic import BaseModel
-import grpc, asyncio
+from pydantic import BaseModel, ConfigDict
+import grpc, asyncio, taskgroup
 from functools import reduce
 
 
-class BullyElectionImpl(BullyElectionServicer, BaseModel):
-    id: str  # server-id
-    priority: int
-    leader: str = ""
-    known_servers: dict[str, str]
-    
+class BullyElectionImpl(BullyElectionServicer):
+
+    def __init__(self, id: str, priority: int, known_servers) -> None:
+        self.id: str = id  # server-id
+        self.priority: int = priority
+        self.leader: str = ""
+        self.known_servers: dict[str, str] = known_servers
+
     async def Election(self, request, context) -> CandidateMessage:
         return CandidateMessage(self.priority)
 
@@ -26,7 +28,7 @@ class BullyElectionImpl(BullyElectionServicer, BaseModel):
         async def higher_than(addr):
             async with grpc.aio.insecure_channel(addr) as ch:
                 stub = BullyElectionStub(ch)
-                resp: CandidateMessage | asyncio.TimeoutError= await asyncio.wait_for(
+                resp: CandidateMessage | asyncio.TimeoutError = await asyncio.wait_for(
                     stub.Request(ElectionMessage()), timeout=5
                 )
                 match resp:
@@ -36,7 +38,7 @@ class BullyElectionImpl(BullyElectionServicer, BaseModel):
                         return True
 
         tasks = []
-        async with asyncio.TaskGroup() as tg:  # type: ignore
+        async with taskgroup.TaskGroup() as tg:  # type: ignore
             for addr in self.known_servers.values():
                 tasks.append(tg.create_task(higher_than(addr)))
 
@@ -48,7 +50,7 @@ class BullyElectionImpl(BullyElectionServicer, BaseModel):
         async def inform(addr):
             async with grpc.aio.insecure_channel(addr) as ch:
                 stub = BullyElectionStub(ch)
-                resp: ResponseMessage | asyncio.TimeoutError= await asyncio.wait_for(
+                resp: ResponseMessage | asyncio.TimeoutError = await asyncio.wait_for(
                     stub.Request(ElectionMessage()), timeout=5
                 )
                 match resp:
@@ -56,15 +58,17 @@ class BullyElectionImpl(BullyElectionServicer, BaseModel):
                         return resp.priority < self.priority
                     case asyncio.TimeoutError:
                         return True
+
         tasks = []
-        async with asyncio.TaskGroup() as tg:  # type: ignore
+        import taskgroup
+
+        async with taskgroup.TaskGroup() as tg:  # type: ignore
             for addr in self.known_servers.values():
                 tasks.append(tg.create_task(inform(addr)))
 
         return reduce(
             lambda acc, bool: acc and bool, tasks, True
         )  # juuuust to make its not a false declaration
-
 
     async def RequestPhase(self):
         leader_addr: str = self.known_servers[self.leader]

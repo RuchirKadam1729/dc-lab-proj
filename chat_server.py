@@ -82,14 +82,14 @@ import json
 from SenderAsync import SenderAsync
 
 from datetime import datetime
-from random import randint
+from random import randint, randbytes
 from bully_election import BullyElectionImpl
 
 
 class ChatServer(ChatServerServicer):
 
     def __init__(self, address, known_servers=[]):
-        self.id: str
+        self.id: str = str(randbytes(14))
         self.msgBuffers: dict[str, MsgBuffer]
         self.clients: dict[str, SenderAsync]
         self.seen_msg_ids = list()
@@ -149,7 +149,7 @@ async def main():
 
     cs = ChatServer("0.0.0.0:" + sys.argv[1])
 
-    asyncio.run(cs.bully_election_impl.LifeCycle())
+    asyncio.create_task(cs.bully_election_impl.LifeCycle())
     async with serve(cs.handler, "0.0.0.0", int(sys.argv[1])) as ws:
         await ws.serve_forever()
 
