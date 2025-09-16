@@ -1,7 +1,8 @@
 import logging
 from pydantic import BaseModel
-from protogens.ChatServer_pb2 import *
-from protogens.ChatServer_pb2_grpc import *
+from protos.ChatServer_pb2 import ChatMessage
+
+# from protos.ChatServer_pb2_grpc import
 from pydantic import BaseModel
 import websockets
 import heapq
@@ -9,12 +10,14 @@ import asyncio
 from datetime import datetime
 
 
-class Client(BaseModel):
-    id: str
-    name: str = "Anonymous"
-    chatMessages: list[ChatMessage] = []  # maybe replaced by db later (shrugs)
-    v_clock: dict[str, int] = {}
-    date_time: datetime = datetime.now()
+class Client:
+    def __init__(self, addr, id="abc") -> None:
+        self.addr: str = addr
+        self.id: str = id
+        self.name: str = "Anonymous"
+        self.chatMessages: list[ChatMessage] = []  # maybe replaced by db later (shrugs)
+        self.v_clock: dict[str, int] = {}
+        self.date_time: datetime = datetime.now()
 
     async def receive(self, chatMessages: ChatMessage):
         self.chatMessages.append(chatMessages)
@@ -59,7 +62,7 @@ import sys
 
 
 async def main():
-    client = Client(id=sys.argv[1])
+    client = Client(addr=f"ws://0.0.0.0:{sys.argv[1]}")
     server_addr = sys.argv[2]
     from websockets.asyncio.client import connect
 

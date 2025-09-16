@@ -1,10 +1,20 @@
-from protogens.ChatServer_pb2 import *
-from protogens.ChatServer_pb2_grpc import *  # type: ignore
+from protos.ChatServer_pb2 import ChatMessage, ChatServerResponse
+from protos.ChatServer_pb2_grpc import ChatServerServicer, ChatServerStub
+
 import grpc
 
-known_servers = dict(
+known_servers_grpc = dict(
     {"0.0.0.0:9001": "srv-A", "0.0.0.0:9002": "srv-B", "0.0.0.0:9003": "srv-C"}
 )
+own_servers_ws = dict(
+    {
+        "ws://0.0.0.0:19001": "srv-A",
+        "ws://0.0.0.0:19002": "srv-B",
+        "ws://0.0.0.0:19003": "srv-C",
+    }
+)
+known_seq_nums = dict({"0.0.0.0:9001": 1, "0.0.0.0:9002": 2, "0.0.0.0:9003": 3})
+known_priors = dict({"0.0.0.0:9001": 3, "0.0.0.0:9002": 2, "0.0.0.0:9003": 1})
 
 
 class MsgBufferNode:
