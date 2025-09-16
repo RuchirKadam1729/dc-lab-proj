@@ -1,5 +1,5 @@
-from protos.ChatServer_pb2 import ChatMessage, ChatServerResponse
-from protos.ChatServer_pb2_grpc import ChatServerServicer, ChatServerStub
+from ChatServer_pb2 import ChatMessage, ChatServerResponse
+from ChatServer_pb2_grpc import ChatServerServicer, ChatServerStub
 
 import grpc
 
@@ -56,7 +56,7 @@ class ChatServer(ChatServerServicer):
             id=self.id, priority=randint(1, 9), known_servers=known_servers
         )
 
-    async def Forward(self, request: ChatMessage, context=None):
+    async def Forward(self, request: ChatMessage, context=None) -> ChatServerResponse:
         for key, value in request.v_clock.items():
             self.v_clock[key] = max(self.v_clock.get(key, 0), value)
         for key in request.v_clock.keys():
@@ -64,36 +64,40 @@ class ChatServer(ChatServerServicer):
 
         # might still be buggy :/
         if request.msg_id in self.seen_msg_ids:
-            ChatServerResponse().status_code = ChatServerResponse.status.DUP
+            ChatServerResponse(status_code=ChatServerResponse.DUP)
         self.seen_msg_ids.append(request.msg_id)
 
         sender = self.clients.get(request.recipient_id)
         if sender:
             sender.send(request.SerializeToString())
-            return "DELIVERED_LOCAL"
+            return ChatServerResponse(status_code=ChatServerResponse.DELIVERED_LOCAL)
 
         if request.recipient_id in self.clients:
             self.msgBuffers[request.recipient_id].buffer_in(request)
-            return "QUEUED_LOCAL"
+            return ChatServerResponse(status_code=ChatServerResponse.QUEUED_LOCAL)
 
         for addr in self.known_servers:
             try:
                 async with grpc.aio.insecure_channel(addr) as ch:
                     stub = ChatServerStub(ch)
                     resp: ChatServerResponse = await stub.Forward(request)
-                    if resp.status_code == resp.OK:
-                        return "DELIVERED_REMOTE"
-                    if resp.status_code == resp.ERR:
-                        return "QUEUED_REMOTE"
+                    if resp.status_code == resp.DELIVERED_LOCAL | resp.DELIVERED_REMOTE:
+                        return ChatServerResponse(
+                            status_code=ChatServerResponse.DELIVERED_REMOTE
+                        )
+                    else:
+                        return ChatServerResponse(
+                            status_code=ChatServerResponse.QUEUED_REMOTE
+                        )
             except Exception:
                 continue
         self.msgBuffers[request.recipient_id].buffer_in(request)
-        return "QUEUED_FALLBACK"
+        return ChatServerResponse(status_code=ChatServerResponse.QUEUED_FALLBACK)
 
     async def handler(self, websocket):
         async for message in websocket:
             print("Received message:", message)
-        await self.Forward(message)
+            await self.Forward(message)
 
 
 import asyncio, websockets

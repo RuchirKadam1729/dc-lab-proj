@@ -37,10 +37,18 @@ class ChatServerResponse(_message.Message):
     __slots__ = ("msg_id", "status_code", "payload", "v_clock", "date_time")
     class status(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
         __slots__ = ()
-        OK: _ClassVar[ChatServerResponse.status]
-        ERR: _ClassVar[ChatServerResponse.status]
-    OK: ChatServerResponse.status
-    ERR: ChatServerResponse.status
+        DUP: _ClassVar[ChatServerResponse.status]
+        DELIVERED_LOCAL: _ClassVar[ChatServerResponse.status]
+        QUEUED_LOCAL: _ClassVar[ChatServerResponse.status]
+        DELIVERED_REMOTE: _ClassVar[ChatServerResponse.status]
+        QUEUED_REMOTE: _ClassVar[ChatServerResponse.status]
+        QUEUED_FALLBACK: _ClassVar[ChatServerResponse.status]
+    DUP: ChatServerResponse.status
+    DELIVERED_LOCAL: ChatServerResponse.status
+    QUEUED_LOCAL: ChatServerResponse.status
+    DELIVERED_REMOTE: ChatServerResponse.status
+    QUEUED_REMOTE: ChatServerResponse.status
+    QUEUED_FALLBACK: ChatServerResponse.status
     class VClockEntry(_message.Message):
         __slots__ = ("key", "value")
         KEY_FIELD_NUMBER: _ClassVar[int]

@@ -1,11 +1,10 @@
 import logging
 from pydantic import BaseModel
-from protos.ChatServer_pb2 import ChatMessage
+from ChatServer_pb2 import ChatMessage
 
 # from protos.ChatServer_pb2_grpc import
 from pydantic import BaseModel
 import websockets
-import heapq
 import asyncio
 from datetime import datetime
 

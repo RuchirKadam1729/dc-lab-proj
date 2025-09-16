@@ -1,6 +1,6 @@
 # from chat_server import known_servers
-from protos.BullyElection_pb2 import *
-from protos.BullyElection_pb2_grpc import *
+from BullyElection_pb2 import *
+from BullyElection_pb2_grpc import *
 from pydantic import BaseModel, ConfigDict
 import grpc, asyncio, taskgroup
 from functools import reduce
@@ -37,13 +37,13 @@ class BullyElectionImpl(BullyElectionServicer):
                     case asyncio.TimeoutError:
                         return True
 
-        tasks = []
-        async with taskgroup.TaskGroup() as tg:  # type: ignore
+        return_vals = []
+        async with taskgroup.TaskGroup() as tg:  #support for older pythons
             for addr in self.known_servers.values():
-                tasks.append(tg.create_task(higher_than(addr)))
+                return_vals.append(tg.create_task(higher_than(addr)))
 
         return reduce(
-            lambda acc, bool: acc and bool, tasks, True
+            lambda acc, bool: acc and bool, return_vals, True
         )  # greater than all, he won election
 
     async def LeaderPhase(self):
@@ -59,15 +59,14 @@ class BullyElectionImpl(BullyElectionServicer):
                     case asyncio.TimeoutError:
                         return True
 
-        tasks = []
-        import taskgroup
+        return_vals = []
 
-        async with taskgroup.TaskGroup() as tg:  # type: ignore
+        async with taskgroup.TaskGroup() as tg:
             for addr in self.known_servers.values():
-                tasks.append(tg.create_task(inform(addr)))
+                return_vals.append(tg.create_task(inform(addr)))
 
         return reduce(
-            lambda acc, bool: acc and bool, tasks, True
+            lambda acc, bool: acc and bool, return_vals, True
         )  # juuuust to make its not a false declaration
 
     async def RequestPhase(self):

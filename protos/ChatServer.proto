@@ -27,4 +27,3 @@ message ChatServerResponse {
   map<string, int32> v_clock = 4;
   google.protobuf.Timestamp date_time = 5;
 }
-

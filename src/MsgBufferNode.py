@@ -1,4 +1,6 @@
-from protos.ChatServer_pb2 import ChatMessage
+from ChatServer_pb2 import ChatMessage
+
+
 class MsgBufferNode:
     def __init__(self, val: ChatMessage):
         self.val = val
