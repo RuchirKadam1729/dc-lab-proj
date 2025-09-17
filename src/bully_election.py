@@ -1,7 +1,13 @@
+#!/usr/bin/env python3
+# bully_election.py
 import asyncio
 import logging
 import random
+from typing import Dict
+
 import grpc
+from google.protobuf.empty_pb2 import Empty
+
 from BullyElection_pb2 import (
     CandidateMessage,
     LeaderMessage,
@@ -9,12 +15,9 @@ from BullyElection_pb2 import (
     ResponseMessage,
     ElectionMessage,
 )
-from BullyElection_pb2_grpc import (
-    BullyElectionServicer,
-    BullyElectionStub,
-    add_BullyElectionServicer_to_server,
-)
+from BullyElection_pb2_grpc import BullyElectionServicer, BullyElectionStub
 
+logging.basicConfig(level=logging.INFO)
 
 # tuning knobs
 ELECTION_ROUND_INTERVAL = 2.0  # seconds between rounds
@@ -41,7 +44,7 @@ class BullyElectionImpl(BullyElectionServicer):
         self.id = id
         self.priority = priority
         self.leader_addr = leader_addr
-        self.known_servers: dict[str, str] = dict(known_servers or {})
+        self.known_servers: Dict[str, str] = dict(known_servers or {})
         self.leader: str | None = None
         # optional: address string for this node (host:port) so we can skip contacting self
         self.self_grpc_addr = self_grpc_addr
@@ -58,11 +61,11 @@ class BullyElectionImpl(BullyElectionServicer):
         # Not used in this minimal implementation but keep for completeness
         return CandidateMessage(priority=self.priority)
 
-    async def Leader(self, request: LeaderMessage, context) -> None:
+    async def Leader(self, request: LeaderMessage, context) -> Empty:
         # remote telling us who the leader is
         self.leader = request.leader_id
         logging.info("%s: Leader RPC received, leader=%s", self.id, self.leader)
-        return None
+        return Empty()
 
     async def Request(self, request, context) -> ResponseMessage:
         # peer asking our priority / alive-ness
@@ -89,7 +92,7 @@ class BullyElectionImpl(BullyElectionServicer):
                 return None
 
         logging.info("%s: starting ElectionPhase, checking peers", self.id)
-        results = []
+        results: list[bool | None] = []
         for peer_id, addr in self.known_servers.items():
             # skip self if present in map (match by addr or id)
             if addr == self.self_grpc_addr or peer_id == self.id:
@@ -105,13 +108,20 @@ class BullyElectionImpl(BullyElectionServicer):
             # small delay so logs from different nodes are readable
             await asyncio.sleep(random.uniform(PER_PEER_DELAY_MIN, PER_PEER_DELAY_MAX))
             if peer_priority is None:
-                # unreachable → treat as not strictly higher (so it doesn't block us)
-                results.append(True)
+                # unreachable -> mark as None
+                results.append(None)
             else:
-                # True means peer is lower or equal priority (OK for us), False means peer is higher (we lose)
+                # True means peer is lower or equal priority (OK for us),
+                # False means peer is higher (we lose)
                 results.append(peer_priority <= self.priority)
-        # If all results are True => no reachable peer had priority > self → we can be leader
-        am_leader = all(results) if results else True
+
+        # Conservative decision: require at least one contacted peer to consider self-election
+        contacted = sum(1 for r in results if r is not None)
+        if contacted == 0:
+            am_leader = False
+        else:
+            am_leader = all(r for r in results if r is not None)
+
         logging.info(
             "%s: ElectionPhase result -> %s (results=%s)", self.id, am_leader, results
         )
@@ -130,12 +140,15 @@ class BullyElectionImpl(BullyElectionServicer):
             try:
                 async with grpc.aio.insecure_channel(addr) as ch:
                     stub = BullyElectionStub(ch)
+                    # expect the peer to accept a Leader RPC (we return Empty())
                     await asyncio.wait_for(
                         stub.Leader(LeaderMessage(leader_id=self.id)), timeout=1.5
                     )
                     return True
             except Exception as exc:
-                logging.info("%s: inform_peer(%s) failed/unreachable: %s", self.id, addr, exc)
+                logging.info(
+                    "%s: inform_peer(%s) failed/unreachable: %s", self.id, addr, exc
+                )
                 return False
 
         results = []

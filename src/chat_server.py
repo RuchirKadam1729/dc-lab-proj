@@ -1,24 +1,38 @@
-from ChatServer_pb2 import ChatMessage, ChatServerResponse
-from ChatServer_pb2_grpc import ChatServerServicer, ChatServerStub
-from ChatServer_pb2_grpc import add_ChatServerServicer_to_server
-import grpc
-
-
+#!/usr/bin/env python3
+# chat_server.py
+import asyncio
+import json
+import logging
+import heapq
 from dataclasses import dataclass
-import heapq, logging
+from datetime import datetime
+from random import randbytes
+from typing import List
+
+import grpc
+from google.protobuf.json_format import MessageToJson, Parse
+from google.protobuf.empty_pb2 import Empty
+from websockets.asyncio.server import serve
+
+from ChatServer_pb2 import ChatMessage, ChatServerResponse
+from ChatServer_pb2_grpc import (
+    ChatServerServicer,
+    ChatServerStub,
+    add_ChatServerServicer_to_server,
+)
+from BullyElection_pb2_grpc import add_BullyElectionServicer_to_server
+
+# local modules - ensure these exist in your project
 from MsgBufferNode import MsgBufferNode
+from SenderAsync import SenderAsync
+from bully_election import BullyElectionImpl
 
 logging.basicConfig(level=logging.INFO)
-from BullyElection_pb2_grpc import (
-    BullyElectionServicer,
-    BullyElectionStub,
-    add_BullyElectionServicer_to_server,
-)
 
 
 @dataclass
 class MsgBuffer:
-    buf: list[MsgBufferNode]
+    buf: List[MsgBufferNode]
 
     def buffer_in(self, msg: ChatMessage):
         heapq.heappush(self.buf, MsgBufferNode(msg))
@@ -27,30 +41,22 @@ class MsgBuffer:
         return heapq.heappop(self.buf).val
 
 
-import json
-from SenderAsync import SenderAsync
-
-from datetime import datetime
-from random import randint, randbytes
-from bully_election import BullyElectionImpl
-from google.protobuf.json_format import MessageToJson, Parse
-
 default_leader_addr = "0.0.0.0:12345"
 
 
 class ChatServer(ChatServerServicer):
-
     def __init__(
         self,
-        ws_addr,
-        grpc_addr,
-        priority,
-        seq_num,
+        ws_addr: str,
+        grpc_addr: str,
+        priority: int,
+        seq_num: int,
         known_ws_servers: dict | None = None,
         known_grpc_servers: dict | None = None,
     ):
         from collections import defaultdict
 
+        # printable hex id
         self.id = randbytes(14).hex()
         # create buffers on first access to avoid KeyError
         self.msgBuffers: dict[str, MsgBuffer] = defaultdict(lambda: MsgBuffer([]))
@@ -70,9 +76,10 @@ class ChatServer(ChatServerServicer):
             priority=self.priority,
             known_servers=self.known_grpc_servers,
             leader_addr=default_leader_addr,
-            self_grpc_addr=self.grpc_addr,  # <= THIS LINE added
+            self_grpc_addr=self.grpc_addr,
         )
 
+    # ChatServer gRPC method
     async def Forward(self, request: ChatMessage, context=None) -> ChatServerResponse:
         # Merge incoming v-clock into server clock
         for k, v in request.v_clock.items():
@@ -85,43 +92,21 @@ class ChatServer(ChatServerServicer):
         request.v_clock.clear()
         request.v_clock.update(self.v_clock)
 
-        # might still be buggy :/
         # dedupe: return immediately on duplicate
         if request.msg_id in self.seen_msg_ids:
             return ChatServerResponse(status_code=ChatServerResponse.DUP)
         self.seen_msg_ids.add(request.msg_id)
 
+        # send if recipient connected, otherwise queue locally
         sender = self.clients.get(request.recipient_id)
         if sender:
             # fire-and-forget enqueue. sender.send is non-awaitable by design.
             sender.send(MessageToJson(request))
             return ChatServerResponse(status_code=ChatServerResponse.DELIVERED_LOCAL)
 
-        if request.recipient_id in self.clients:
-            self.msgBuffers[request.recipient_id].buffer_in(request)
-            return ChatServerResponse(status_code=ChatServerResponse.QUEUED_LOCAL)
-
-        for addr in self.known_grpc_servers.values():
-            try:
-                async with grpc.aio.insecure_channel(addr) as ch:
-                    stub = ChatServerStub(ch)
-                    resp: ChatServerResponse = await stub.Forward(request)
-                    # map any delivered enum from peer to our DELIVERED_REMOTE
-                    if resp.status_code in (
-                        ChatServerResponse.DELIVERED_LOCAL,
-                        ChatServerResponse.DELIVERED_REMOTE,
-                    ):
-                        return ChatServerResponse(
-                            status_code=ChatServerResponse.DELIVERED_REMOTE
-                        )
-                    else:
-                        return ChatServerResponse(
-                            status_code=ChatServerResponse.QUEUED_REMOTE
-                        )
-            except Exception:
-                continue
+        # recipient not connected -> queue locally
         self.msgBuffers[request.recipient_id].buffer_in(request)
-        return ChatServerResponse(status_code=ChatServerResponse.QUEUED_FALLBACK)
+        return ChatServerResponse(status_code=ChatServerResponse.QUEUED_LOCAL)
 
     async def handler(self, websocket):
         # 1) expect registration JSON as first message
@@ -149,9 +134,7 @@ class ChatServer(ChatServerServicer):
         try:
             async for message_json in websocket:
                 message = Parse(message_json, ChatMessage())
-                print("Received message:", message_json)
-                # ensure sender registered for this client (we already did)
-                # when this client sends, we may want to update its v_clock etc.
+                logging.info("Received message from client %s: %s", client_id, message_json)
                 await self.Forward(message)
         finally:
             # cleanup
@@ -159,15 +142,12 @@ class ChatServer(ChatServerServicer):
             await sender.close()
 
 
-import asyncio
-from websockets.asyncio.server import serve
-
-
 async def main():
     import sys
 
     args: dict[str, str] = {}
 
+    # simple arg parsing (expects pairs)
     for i in range(1, len(sys.argv) - 1):
         arg = sys.argv[i]
         next_arg = sys.argv[i + 1]
@@ -191,6 +171,7 @@ async def main():
         "srv-B": "127.0.0.1:50052",
         "srv-C": "127.0.0.1:50053",
     }
+
     cs = ChatServer(
         ws_addr=f'ws://0.0.0.0:{args["ws_port"]}',
         grpc_addr=f'127.0.0.1:{args["grpc_port"]}',
@@ -199,7 +180,8 @@ async def main():
         known_ws_servers=KNOWN_WS,
         known_grpc_servers=KNOWN_GRPC,
     )
-     # start gRPC aio server so peers can contact us
+
+    # start gRPC aio server so peers can contact us
     grpc_server = grpc.aio.server()
     # register your servicer implementations
     add_ChatServerServicer_to_server(cs, grpc_server)
@@ -214,7 +196,7 @@ async def main():
 
     # keep it running in background (only schedule once)
     asyncio.create_task(grpc_server.wait_for_termination())
-    # ---------- <ADD THIS BLOCK> ----------
+
     # start bully lifecycle (background task) and make failures visible
     life_task = asyncio.create_task(cs.bully_election_impl.LifeCycle())
 
@@ -233,7 +215,6 @@ async def main():
 
     # run one immediate election round so the node acts right away (handy for testing)
     asyncio.create_task(cs.bully_election_impl.ElectionPhase())
-    # ---------- </ADD THIS BLOCK> ----------
 
     async with serve(cs.handler, "0.0.0.0", int(args["ws_port"])) as ws:
         print(
@@ -243,7 +224,5 @@ async def main():
 
 
 if __name__ == "__main__":
-    import logging
-
-    logging.basicConfig()
+    logging.basicConfig(level=logging.INFO)
     asyncio.run(main())
