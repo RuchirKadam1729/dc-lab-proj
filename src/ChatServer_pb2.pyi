@@ -5,7 +5,7 @@ from google.protobuf.internal import containers as _containers
 from google.protobuf.internal import enum_type_wrapper as _enum_type_wrapper
 from google.protobuf import descriptor as _descriptor
 from google.protobuf import message as _message
-from collections.abc import Iterable as _Iterable, Mapping as _Mapping
+from collections.abc import Mapping as _Mapping
 from typing import ClassVar as _ClassVar, Optional as _Optional, Union as _Union
 
 DESCRIPTOR: _descriptor.FileDescriptor
@@ -28,10 +28,10 @@ class ChatMessage(_message.Message):
     msg_id: str
     sender_id: str
     recipient_id: str
-    payload: _containers.RepeatedScalarFieldContainer[str]
+    payload: str
     v_clock: _containers.ScalarMap[str, int]
     date_time: _timestamp_pb2.Timestamp
-    def __init__(self, msg_id: _Optional[str] = ..., sender_id: _Optional[str] = ..., recipient_id: _Optional[str] = ..., payload: _Optional[_Iterable[str]] = ..., v_clock: _Optional[_Mapping[str, int]] = ..., date_time: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ...) -> None: ...
+    def __init__(self, msg_id: _Optional[str] = ..., sender_id: _Optional[str] = ..., recipient_id: _Optional[str] = ..., payload: _Optional[str] = ..., v_clock: _Optional[_Mapping[str, int]] = ..., date_time: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ...) -> None: ...
 
 class ChatServerResponse(_message.Message):
     __slots__ = ("msg_id", "status_code", "payload", "v_clock", "date_time")
@@ -63,7 +63,7 @@ class ChatServerResponse(_message.Message):
     DATE_TIME_FIELD_NUMBER: _ClassVar[int]
     msg_id: str
     status_code: ChatServerResponse.status
-    payload: _containers.RepeatedScalarFieldContainer[str]
+    payload: str
     v_clock: _containers.ScalarMap[str, int]
     date_time: _timestamp_pb2.Timestamp
-    def __init__(self, msg_id: _Optional[str] = ..., status_code: _Optional[_Union[ChatServerResponse.status, str]] = ..., payload: _Optional[_Iterable[str]] = ..., v_clock: _Optional[_Mapping[str, int]] = ..., date_time: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ...) -> None: ...
+    def __init__(self, msg_id: _Optional[str] = ..., status_code: _Optional[_Union[ChatServerResponse.status, str]] = ..., payload: _Optional[str] = ..., v_clock: _Optional[_Mapping[str, int]] = ..., date_time: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ...) -> None: ...

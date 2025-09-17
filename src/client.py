@@ -1,37 +1,39 @@
 import logging
 from pydantic import BaseModel
 from ChatServer_pb2 import ChatMessage
-
-# from protos.ChatServer_pb2_grpc import
-from pydantic import BaseModel
-import websockets
 import asyncio
 from datetime import datetime
+import json, uuid
+from google.protobuf.json_format import MessageToJson, Parse
 
 
 class Client:
-    def __init__(self, addr, id="abc") -> None:
+    def __init__(self, addr, id) -> None:
         self.addr: str = addr
         self.id: str = id
         self.name: str = "Anonymous"
         self.chatMessages: list[ChatMessage] = []  # maybe replaced by db later (shrugs)
-        self.v_clock: dict[str, int] = {}
+        self.v_clock: dict[str, int] = {self.id: 0}
         self.date_time: datetime = datetime.now()
 
     async def receive(self, chatMessages: ChatMessage):
         self.chatMessages.append(chatMessages)
 
+
     async def produce(self):
         to: str = await asyncio.to_thread(input, "to: ")
         str_msg: str = await asyncio.to_thread(input, "msg: ")
-        from datetime import datetime
+
+        # **increment our local clock for this send event**
+        self.v_clock[self.id] = self.v_clock.get(self.id, 0) + 1
 
         return ChatMessage(
             sender_id=self.id,
             recipient_id=to,
             payload=str_msg,
             date_time=datetime.now(),
-            v_clock=self.v_clock,
+            v_clock=dict(self.v_clock),  # send a copy
+            msg_id=str(uuid.uuid4()),  # unique id for dedupe
         )
 
     async def producer_handler(self, websocket):
@@ -40,7 +42,8 @@ class Client:
         while True:
             try:
                 message = await self.produce()
-                await websocket.send(message)
+                message_json = MessageToJson(message)
+                await websocket.send(message_json)
             except ConnectionClosed:
                 break
 
@@ -49,7 +52,8 @@ class Client:
         print("Received message:", message)
 
     async def consumer_handler(self, websocket):
-        async for message in websocket:
+        async for message_json in websocket:
+            message = Parse(message_json, ChatMessage())
             await self.consume(message)
 
     async def handler(self, websocket):
@@ -62,11 +66,26 @@ import sys
 
 
 async def main():
-    client = Client(addr=f"ws://0.0.0.0:{sys.argv[1]}")
-    server_addr = sys.argv[2]
+    args: dict[str, str] = {}
+
+    for i in range(1, len(sys.argv) - 1):
+        arg = sys.argv[i]
+        next_arg = sys.argv[i + 1]
+        match arg:
+            case "-p":
+                args["port"] = next_arg
+            case "--server-addr":
+                args["server-addr"] = next_arg
+            case "--id":
+                args["id"] = next_arg
+
+    client = Client(id=args["id"], addr=f'ws://0.0.0.0:{args["port"]}')
+    server_addr = args["server-addr"]
     from websockets.asyncio.client import connect
 
     async with connect(server_addr) as ws:
+        # register
+        await ws.send(json.dumps({"client_id": client.id}))
         await client.handler(ws)
 
 
