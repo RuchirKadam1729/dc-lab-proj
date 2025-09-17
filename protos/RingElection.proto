@@ -1,12 +1,24 @@
 syntax = "proto3";
+
+import "google/protobuf/empty.proto";
+
 service RingElection {
-    rpc Election(ElectionMessage) returns (CandidateMessage);
-    rpc Leader(LeaderMessage) returns (ResponseMessage);
-    rpc Request(RequestMessage) returns (ResponseMessage);
+  rpc Election(ElectionMessage) returns (google.protobuf.Empty);
+  rpc Leader(LeaderMessage) returns (google.protobuf.Empty);
+  rpc Request(RequestMessage) returns (ResponseMessage);
+}
+
+message ElectionMessage {
+  string originator_id = 1;
+  repeated string node_ids = 2;
+  repeated int32 priorities = 3;
+}
+
+message LeaderMessage {
+  string leader_id = 1;
+  string originator_id = 2;
 }
 
 message RequestMessage {}
-message ResponseMessage {int32 priority = 1;}
-message ElectionMessage {repeated int32 priors = 1;}
-message CandidateMessage {int32 priority = 1;}
-message LeaderMessage {string leader_id = 1;}
+
+message ResponseMessage { int32 priority = 1; }
