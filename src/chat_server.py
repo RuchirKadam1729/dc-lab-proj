@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# chat_server.py
+# chat_server.py (Bully Election Version)
 import asyncio
 import json
 import logging
@@ -21,13 +21,13 @@ from ChatServer_pb2_grpc import (
     add_ChatServerServicer_to_server,
 )
 
-# Ring election servicer registration
-from RingElection_pb2_grpc import add_RingElectionServicer_to_server
+# Bully election servicer registration
+from BullyElection_pb2_grpc import add_BullyElectionServicer_to_server
 
 # local modules - ensure these exist in your project
 from MsgBufferNode import MsgBufferNode
 from SenderAsync import SenderAsync
-from ring_election import RingElectionImpl
+from bully_election import BullyElectionImpl
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -45,20 +45,22 @@ class MsgBuffer:
         return heapq.heappop(self.buf).val
 
 
-# Define the ring topology - this determines the election order
-RING_TOPOLOGY = [
-    ("srv-A", "127.0.0.1:50051", "0.0.0.0:9001"),
-    ("srv-B", "127.0.0.1:50052", "0.0.0.0:9002"),
-    ("srv-C", "127.0.0.1:50053", "0.0.0.0:9003"),
+# Define the server topology with priorities
+# Higher priority numbers win in bully algorithm
+SERVER_TOPOLOGY = [
+    ("srv-A", "127.0.0.1:50051", "0.0.0.0:9001", 9),  # Highest priority
+    ("srv-B", "127.0.0.1:50052", "0.0.0.0:9002", 5),  # Medium priority
+    ("srv-C", "127.0.0.1:50053", "0.0.0.0:9003", 1),  # Lowest priority
 ]
 
-# Create ordered dictionaries preserving ring order
+# Create dictionaries from topology
 from collections import OrderedDict
 
 KNOWN_GRPC = OrderedDict(
-    [(srv_id, grpc_addr) for srv_id, grpc_addr, _ in RING_TOPOLOGY]
+    [(srv_id, grpc_addr) for srv_id, grpc_addr, _, _ in SERVER_TOPOLOGY]
 )
-KNOWN_WS = OrderedDict([(srv_id, ws_addr) for srv_id, _, ws_addr in RING_TOPOLOGY])
+KNOWN_WS = OrderedDict([(srv_id, ws_addr) for srv_id, _, ws_addr, _ in SERVER_TOPOLOGY])
+SERVER_PRIORITIES = {srv_id: priority for srv_id, _, _, priority in SERVER_TOPOLOGY}
 
 # Create port mappings for server identification
 PORT_TO_SERVER_ID = {
@@ -66,8 +68,6 @@ PORT_TO_SERVER_ID = {
     "50052": "srv-B",
     "50053": "srv-C",
 }
-
-default_leader_addr = "127.0.0.1:50051"  # srv-A's address
 
 
 class ChatServer(ChatServerServicer):
@@ -87,7 +87,7 @@ class ChatServer(ChatServerServicer):
         # printable hex id for unique message identification
         self.unique_id = randbytes(8).hex()
 
-        # keep insertion-order for ring; use OrderedDict to guarantee order
+        # keep server mappings
         self.known_ws_servers = OrderedDict(known_ws_servers or {})
         self.known_grpc_servers = OrderedDict(known_grpc_servers or {})
 
@@ -112,12 +112,11 @@ class ChatServer(ChatServerServicer):
             self.grpc_addr,
         )
 
-        # attach ring election impl as attribute
-        self.ring_election_impl: RingElectionImpl = RingElectionImpl(
-            server_id=self.server_id,  # Use logical server ID
+        # Create bully election implementation
+        self.bully_election_impl: BullyElectionImpl = BullyElectionImpl(
+            server_id=self.server_id,
             priority=self.priority,
             known_servers=self.known_grpc_servers,
-            leader_addr=default_leader_addr,
             self_grpc_addr=self.grpc_addr,
         )
 
@@ -237,18 +236,20 @@ class ChatServer(ChatServerServicer):
 
     def get_status(self) -> dict:
         """Get server status including election info"""
+        bully_status = self.bully_election_impl.get_status()
         return {
             "server_id": self.server_id,
             "unique_id": self.unique_id,
             "priority": self.priority,
             "grpc_addr": self.grpc_addr,
             "ws_addr": self.ws_addr,
-            "current_leader": self.ring_election_impl.get_current_leader(),
-            "is_leader": self.ring_election_impl.is_leader(),
+            "current_leader": self.bully_election_impl.get_current_leader(),
+            "is_leader": self.bully_election_impl.is_leader(),
             "connected_clients": list(self.clients.keys()),
             "queued_messages": {
                 client_id: len(buf.buf) for client_id, buf in self.msgBuffers.items()
             },
+            "bully_election_status": bully_status,
         }
 
 
@@ -268,15 +269,23 @@ async def setup_server(args: dict) -> ChatServer:
     grpc_addr = KNOWN_GRPC[server_id]
     ws_addr = KNOWN_WS[server_id]
 
+    # Use the predefined priority for this server, but allow override from command line
+    default_priority = SERVER_PRIORITIES[server_id]
+    actual_priority = int(args.get("priority", default_priority))
+
     logging.info(
-        "Setting up server: id=%s, grpc=%s, ws=%s", server_id, grpc_addr, ws_addr
+        "Setting up server: id=%s, grpc=%s, ws=%s, priority=%s",
+        server_id,
+        grpc_addr,
+        ws_addr,
+        actual_priority,
     )
 
     cs = ChatServer(
         server_id=server_id,
         ws_addr=ws_addr,
         grpc_addr=grpc_addr,
-        priority=int(args["priority"]),
+        priority=actual_priority,
         seq_num=int(args["seqnum"]),
         known_ws_servers=KNOWN_WS,
         known_grpc_servers=KNOWN_GRPC,
@@ -291,7 +300,7 @@ async def start_grpc_server(cs: ChatServer) -> grpc.aio.Server:
 
     # register servicers
     add_ChatServerServicer_to_server(cs, grpc_server)
-    add_RingElectionServicer_to_server(cs.ring_election_impl, grpc_server)
+    add_BullyElectionServicer_to_server(cs.bully_election_impl, grpc_server)
 
     # bind wildcard so kernel accepts incoming wire connections
     bind_port = cs.grpc_addr.split(":", 1)[1]  # e.g. "50051"
@@ -309,28 +318,32 @@ async def start_grpc_server(cs: ChatServer) -> grpc.aio.Server:
 
 
 async def start_election_lifecycle(cs: ChatServer) -> asyncio.Task:
-    """Start the ring election lifecycle"""
+    """Start the bully election lifecycle"""
 
     def _on_lifecycle_done(task: asyncio.Task):
         try:
             exc = task.exception()
             if exc:
                 logging.exception(
-                    "%s: Ring LifeCycle task failed", cs.server_id, exc_info=exc
+                    "%s: Bully election lifecycle task failed",
+                    cs.server_id,
+                    exc_info=exc,
                 )
             else:
-                logging.info("%s: Ring LifeCycle task finished normally", cs.server_id)
+                logging.info(
+                    "%s: Bully election lifecycle finished normally", cs.server_id
+                )
         except asyncio.CancelledError:
-            logging.info("%s: Ring LifeCycle cancelled", cs.server_id)
+            logging.info("%s: Bully election lifecycle cancelled", cs.server_id)
 
     # Start background lifecycle task
-    lifecycle_task = asyncio.create_task(cs.ring_election_impl.LifeCycle())
+    lifecycle_task = asyncio.create_task(cs.bully_election_impl.LifeCycle())
     lifecycle_task.add_done_callback(_on_lifecycle_done)
 
-    logging.info("%s: started Ring LifeCycle task", cs.server_id)
+    logging.info("%s: started Bully election lifecycle task", cs.server_id)
 
     # Run one immediate election round for faster startup
-    asyncio.create_task(cs.ring_election_impl.StartElection())
+    asyncio.create_task(cs.bully_election_impl.StartElection())
 
     return lifecycle_task
 
@@ -350,12 +363,15 @@ async def main():
         else:
             i += 1
 
-    required_args = ["ws_port", "grpc_port", "priority", "seqnum"]
+    required_args = ["ws_port", "grpc_port", "seqnum"]
     missing_args = [arg for arg in required_args if arg not in args]
     if missing_args:
         print(f"Missing required arguments: {missing_args}")
         print(
-            "Usage: python chat_server.py --ws_port PORT --grpc_port PORT --priority NUM --seqnum NUM"
+            "Usage: python chat_server.py --ws_port PORT --grpc_port PORT [--priority NUM] --seqnum NUM"
+        )
+        print(
+            "Note: If priority is not specified, default priority for the server will be used"
         )
         sys.exit(1)
 
@@ -375,14 +391,17 @@ async def main():
         # Start WebSocket server
         ws_port = int(args["ws_port"])
 
-        print(f"\n" + "=" * 60)
-        print(f"Server {cs.server_id} started successfully!")
+        print(f"\n" + "=" * 70)
+        print(f"Chat Server with Bully Election Algorithm")
+        print(f"=" * 70)
+        print(f"Server ID: {cs.server_id}")
+        print(f"Priority: {cs.priority} (higher wins)")
         print(f"WebSocket: ws://0.0.0.0:{ws_port}")
         print(f"gRPC: {cs.grpc_addr}")
-        print(f"Priority: {cs.priority}")
         print(f"Sequence Number: {cs.seq_num}")
-        print(f"Ring topology: {list(KNOWN_GRPC.keys())}")
-        print("=" * 60 + "\n")
+        print(f"Known servers: {list(KNOWN_GRPC.keys())}")
+        print(f"Server priorities: {SERVER_PRIORITIES}")
+        print(f"=" * 70 + "\n")
 
         async with serve(cs.handler, "0.0.0.0", ws_port) as ws:
             logging.info(
@@ -395,11 +414,12 @@ async def main():
                     await asyncio.sleep(30)  # Log status every 30 seconds
                     status = cs.get_status()
                     logging.info(
-                        "%s: Status - Leader: %s, Is Leader: %s, Clients: %d",
+                        "%s: Status - Leader: %s, Is Leader: %s, Clients: %d, Priority: %d",
                         cs.server_id,
                         status["current_leader"],
                         status["is_leader"],
                         len(status["connected_clients"]),
+                        cs.priority,
                     )
 
             status_task = asyncio.create_task(status_logger())
@@ -420,4 +440,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-    

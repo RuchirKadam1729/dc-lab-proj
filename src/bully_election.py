@@ -3,7 +3,7 @@
 import asyncio
 import logging
 import random
-from typing import Dict
+from typing import Dict, Set, Optional
 
 import grpc
 from google.protobuf.empty_pb2 import Empty
@@ -20,214 +20,388 @@ from BullyElection_pb2_grpc import BullyElectionServicer, BullyElectionStub
 logging.basicConfig(level=logging.INFO)
 
 # tuning knobs
-ELECTION_ROUND_INTERVAL = 2.0  # seconds between rounds
+ELECTION_TIMEOUT = 2.0
+LEADER_ANNOUNCE_DELAY = 1.0
+LEADER_CHECK_INTERVAL = 5.0
+ELECTION_COOLDOWN = 3.0
 PER_PEER_DELAY_MIN = 0.05
-PER_PEER_DELAY_MAX = 0.12
-LEADER_ANNOUNCE_PAUSE = 1.0
+PER_PEER_DELAY_MAX = 0.1
 
 
 class BullyElectionImpl(BullyElectionServicer):
     """
-    Bully election implementation:
-    - known_servers: dict[server_id -> grpc_addr]
-    - priority: numeric (higher -> wins)
+    Bully election algorithm implementation following Garcia-Molina [1982].
+
+    Key principles:
+    - Process with highest priority always wins
+    - Election messages sent only to higher-priority processes
+    - If no response from higher processes, declare self as coordinator
+    - Coordinator messages sent to all lower-priority processes
     """
 
     def __init__(
         self,
-        id: str,
+        server_id: str,  # logical server ID (srv-A, srv-B, etc.)
         priority: int,
-        leader_addr: str,
         known_servers: dict | None = None,
         self_grpc_addr: str | None = None,
     ):
-        self.id = id
+        self.server_id = server_id
         self.priority = priority
-        self.leader_addr = leader_addr
         self.known_servers: Dict[str, str] = dict(known_servers or {})
-        self.leader: str | None = None
-        # optional: address string for this node (host:port) so we can skip contacting self
         self.self_grpc_addr = self_grpc_addr
+
+        self.leader: Optional[str] = None
+        self._election_in_progress = False
+        self._lock = asyncio.Lock()
+        self._last_election_time = 0
+
         logging.info(
-            "BullyElectionImpl created: id=%s priority=%s known=%s self_addr=%s",
-            self.id,
+            "BullyElectionImpl created: server_id=%s priority=%s known=%s self_addr=%s",
+            self.server_id,
             self.priority,
             list(self.known_servers.keys()),
             self.self_grpc_addr,
         )
 
-    # RPCs other nodes can call on us (simple responses)
-    async def Election(self, request, context) -> CandidateMessage:
-        # Not used in this minimal implementation but keep for completeness
-        return CandidateMessage(priority=self.priority)
+    # ---- RPC handlers ---------------------------------------------------
+    async def Election(self, request: ElectionMessage, context) -> ResponseMessage:
+        """
+        Handle election message from lower-priority process.
+        Send 'alive' response and start our own election if not already running.
+        """
+        logging.info(
+            "%s: Election RPC received from lower-priority process", self.server_id
+        )
+
+        # Send alive message back to sender
+        response = ResponseMessage(priority=self.priority)
+
+        # Start our own election (higher priority process should take over)
+        asyncio.create_task(self._start_election_if_needed())
+
+        return response
 
     async def Leader(self, request: LeaderMessage, context) -> Empty:
-        # remote telling us who the leader is
-        self.leader = request.leader_id
-        logging.info("%s: Leader RPC received, leader=%s", self.id, self.leader)
+        """Handle coordinator announcement from new leader"""
+        logging.info(
+            "%s: Leader RPC received, new leader=%s", self.server_id, request.leader_id
+        )
+
+        async with self._lock:
+            self.leader = request.leader_id
+            self._election_in_progress = False
+
         return Empty()
 
-    async def Request(self, request, context) -> ResponseMessage:
-        # peer asking our priority / alive-ness
+    async def Request(self, request: RequestMessage, context) -> ResponseMessage:
+        """Handle heartbeat/health check request"""
+        logging.debug("%s: Request RPC received (heartbeat)", self.server_id)
         return ResponseMessage(priority=self.priority)
 
-    # --- Core bully logic ------------------------------------------------
-    async def ElectionPhase(self) -> bool:
-        """
-        Return True if this node determines it should declare itself leader,
-        i.e., no reachable peer has strictly greater priority.
-        """
-
-        async def ask_peer(addr: str) -> int | None:
-            # returns peer priority or None if unreachable
-            try:
-                async with grpc.aio.insecure_channel(addr) as ch:
-                    stub = BullyElectionStub(ch)
-                    resp: ResponseMessage = await asyncio.wait_for(
-                        stub.Request(RequestMessage()), timeout=1.5
-                    )
-                    return int(resp.priority)
-            except Exception as exc:
-                logging.info("%s: ask_peer(%s) exception: %s", self.id, addr, exc)
-                return None
-
-        logging.info("%s: starting ElectionPhase, checking peers", self.id)
-        results: list[bool | None] = []
-        for peer_id, addr in self.known_servers.items():
-            # skip self if present in map (match by addr or id)
-            if addr == self.self_grpc_addr or peer_id == self.id:
+    # ---- Helper methods -------------------------------------------------
+    def _get_higher_priority_servers(self) -> Dict[str, str]:
+        """Get servers with higher priority than this one"""
+        higher_servers = {}
+        for srv_id, addr in self.known_servers.items():
+            if srv_id == self.server_id or addr == self.self_grpc_addr:
                 continue
-            peer_priority = await ask_peer(addr)
+            # In our topology, we need to get actual priorities
+            # For now, assume srv-A=high, srv-B=medium, srv-C=low based on naming
+            server_priority = self._get_server_priority(srv_id)
+            if server_priority > self.priority:
+                higher_servers[srv_id] = addr
+        return higher_servers
+
+    def _get_lower_priority_servers(self) -> Dict[str, str]:
+        """Get servers with lower priority than this one"""
+        lower_servers = {}
+        for srv_id, addr in self.known_servers.items():
+            if srv_id == self.server_id or addr == self.self_grpc_addr:
+                continue
+            server_priority = self._get_server_priority(srv_id)
+            if server_priority < self.priority:
+                lower_servers[srv_id] = addr
+        return lower_servers
+
+    def _get_server_priority(self, server_id: str) -> int:
+        """
+        Map server IDs to priorities based on the known topology.
+        This should ideally come from server registration, but for now we'll
+        derive it from the server startup parameters.
+        """
+        # This is a simplified mapping - in real implementation,
+        # you'd want to track actual priorities of each server
+        priority_map = {
+            "srv-A": 9,  # Highest priority
+            "srv-B": 5,  # Medium priority
+            "srv-C": 1,  # Lowest priority
+        }
+        return priority_map.get(server_id, 0)
+
+    async def _send_election_messages(self) -> bool:
+        """
+        Send election messages to all higher-priority processes.
+        Returns True if any process responded (meaning we should not become leader).
+        """
+        higher_servers = self._get_higher_priority_servers()
+
+        if not higher_servers:
             logging.info(
-                "%s: ask_peer(%s -> %s) returned %s",
-                self.id,
-                peer_id,
-                addr,
-                peer_priority,
+                "%s: no higher-priority servers, can become leader", self.server_id
             )
-            # small delay so logs from different nodes are readable
-            await asyncio.sleep(random.uniform(PER_PEER_DELAY_MIN, PER_PEER_DELAY_MAX))
-            if peer_priority is None:
-                # unreachable -> mark as None
-                results.append(None)
-            else:
-                # True means peer is lower or equal priority (OK for us),
-                # False means peer is higher (we lose)
-                results.append(peer_priority <= self.priority)
-
-        # Conservative decision: require at least one contacted peer to consider self-election
-        contacted = sum(1 for r in results if r is not None)
-        if contacted == 0:
-            am_leader = False
-        else:
-            am_leader = all(r for r in results if r is not None)
+            return False
 
         logging.info(
-            "%s: ElectionPhase result -> %s (results=%s)", self.id, am_leader, results
-        )
-        return am_leader
-
-    async def LeaderPhase(self) -> bool:
-        """
-        After ElectionPhase says we can be leader, broadcast Leader message to all peers.
-        Return True if broadcast completed (best-effort).
-        """
-        logging.info(
-            "%s: entering LeaderPhase - announcing leadership to peers", self.id
+            "%s: sending election messages to higher-priority servers: %s",
+            self.server_id,
+            list(higher_servers.keys()),
         )
 
-        async def inform_peer(addr: str) -> bool:
+        responses = []
+        for srv_id, addr in higher_servers.items():
             try:
                 async with grpc.aio.insecure_channel(addr) as ch:
                     stub = BullyElectionStub(ch)
-                    # expect the peer to accept a Leader RPC (we return Empty())
-                    await asyncio.wait_for(
-                        stub.Leader(LeaderMessage(leader_id=self.id)), timeout=1.5
+                    response = await asyncio.wait_for(
+                        stub.Election(ElectionMessage()), timeout=ELECTION_TIMEOUT
                     )
-                    return True
+                    logging.info(
+                        "%s: received alive response from %s (priority=%s)",
+                        self.server_id,
+                        srv_id,
+                        response.priority,
+                    )
+                    responses.append(True)
             except Exception as exc:
                 logging.info(
-                    "%s: inform_peer(%s) failed/unreachable: %s", self.id, addr, exc
+                    "%s: no response from %s (%s): %s",
+                    self.server_id,
+                    srv_id,
+                    addr,
+                    type(exc).__name__,
                 )
-                return False
+                responses.append(False)
 
-        results = []
-        for peer_id, addr in self.known_servers.items():
-            if addr == self.self_grpc_addr or peer_id == self.id:
-                continue
-            ok = await inform_peer(addr)
-            results.append(ok)
             await asyncio.sleep(random.uniform(PER_PEER_DELAY_MIN, PER_PEER_DELAY_MAX))
-        logging.info(
-            "%s: LeaderPhase finished, informed %d peers",
-            self.id,
-            sum(1 for r in results if r),
-        )
-        # best-effort success
-        return True
 
-    async def RequestPhase(self):
-        """
-        Optionally poll the known leader for heartbeats or perform leader-specific tasks.
-        Keep simple: try one quick ping to current leader if known.
-        """
-        if not self.leader:
+        # If any higher-priority process responded, we should not become leader
+        any_alive = any(responses)
+        logging.info(
+            "%s: election phase result - higher processes alive: %s",
+            self.server_id,
+            any_alive,
+        )
+
+        return any_alive
+
+    async def _announce_leadership(self):
+        """Send coordinator messages to all lower-priority processes"""
+        lower_servers = self._get_lower_priority_servers()
+
+        if not lower_servers:
+            logging.info("%s: no lower-priority servers to inform", self.server_id)
             return
+
+        logging.info(
+            "%s: announcing leadership to lower-priority servers: %s",
+            self.server_id,
+            list(lower_servers.keys()),
+        )
+
+        success_count = 0
+        for srv_id, addr in lower_servers.items():
+            try:
+                async with grpc.aio.insecure_channel(addr) as ch:
+                    stub = BullyElectionStub(ch)
+                    await asyncio.wait_for(
+                        stub.Leader(LeaderMessage(leader_id=self.server_id)),
+                        timeout=ELECTION_TIMEOUT,
+                    )
+                    success_count += 1
+                    logging.info(
+                        "%s: informed %s of new leadership", self.server_id, srv_id
+                    )
+            except Exception as exc:
+                logging.info(
+                    "%s: failed to inform %s: %s",
+                    self.server_id,
+                    srv_id,
+                    type(exc).__name__,
+                )
+
+            await asyncio.sleep(random.uniform(PER_PEER_DELAY_MIN, PER_PEER_DELAY_MAX))
+
+        logging.info(
+            "%s: leadership announcement completed, informed %d servers",
+            self.server_id,
+            success_count,
+        )
+
+    async def _start_election_if_needed(self):
+        """Start election if not already in progress and enough time has passed"""
+        current_time = asyncio.get_event_loop().time()
+
+        async with self._lock:
+            if self._election_in_progress:
+                logging.debug("%s: election already in progress", self.server_id)
+                return
+
+            if current_time - self._last_election_time < ELECTION_COOLDOWN:
+                logging.debug("%s: election cooldown in effect", self.server_id)
+                return
+
+            self._election_in_progress = True
+            self._last_election_time = current_time
+
+        try:
+            await self._run_election()
+        finally:
+            async with self._lock:
+                self._election_in_progress = False
+
+    async def _run_election(self):
+        """Core election algorithm implementation"""
+        logging.info(
+            "%s: starting bully election (priority=%s)", self.server_id, self.priority
+        )
+
+        # Phase 1: Send election messages to higher-priority processes
+        higher_processes_alive = await self._send_election_messages()
+
+        if higher_processes_alive:
+            # Some higher-priority process is alive, they will handle leadership
+            logging.info(
+                "%s: higher-priority processes alive, waiting for their decision",
+                self.server_id,
+            )
+            return
+
+        # Phase 2: No higher-priority process responded, become leader
+        logging.info(
+            "%s: no higher-priority processes responded, becoming leader",
+            self.server_id,
+        )
+
+        # Wait a moment to avoid race conditions
+        await asyncio.sleep(LEADER_ANNOUNCE_DELAY)
+
+        async with self._lock:
+            self.leader = self.server_id
+
+        # Phase 3: Announce leadership to lower-priority processes
+        await self._announce_leadership()
+
+        logging.info("%s: successfully became leader", self.server_id)
+
+    async def _check_leader_health(self) -> bool:
+        """Check if current leader is still alive"""
+        if not self.leader:
+            return False
+
+        if self.leader == self.server_id:
+            return True  # We are the leader
+
         leader_addr = self.known_servers.get(self.leader)
         if not leader_addr:
-            return
+            logging.info(
+                "%s: leader %s not in known servers", self.server_id, self.leader
+            )
+            return False
+
         try:
             async with grpc.aio.insecure_channel(leader_addr) as ch:
                 stub = BullyElectionStub(ch)
-                await asyncio.wait_for(stub.Request(RequestMessage()), timeout=1.0)
-                logging.info(
-                    "%s: RequestPhase: leader %s responded", self.id, self.leader
+                response = await asyncio.wait_for(
+                    stub.Request(RequestMessage()), timeout=ELECTION_TIMEOUT
                 )
-        except Exception:
+                logging.debug(
+                    "%s: leader %s is healthy (priority=%s)",
+                    self.server_id,
+                    self.leader,
+                    response.priority,
+                )
+                return True
+        except Exception as exc:
             logging.info(
-                "%s: RequestPhase: leader %s unreachable", self.id, self.leader
+                "%s: leader %s health check failed: %s",
+                self.server_id,
+                self.leader,
+                type(exc).__name__,
             )
-            # if leader unreachable, clear and force next election
-            self.leader = None
+            return False
+
+    # ---- External APIs -------------------------------------------------
+    async def StartElection(self):
+        """Manually trigger an election (e.g., on startup or leader failure)"""
+        logging.info("%s: manually starting election", self.server_id)
+        await self._start_election_if_needed()
 
     async def LifeCycle(self):
-        """
-        Main loop: run election rounds periodically. If we win, announce leader.
-        """
+        """Main lifecycle loop - monitors leader and triggers elections as needed"""
+        logging.info("%s: starting bully election lifecycle", self.server_id)
+
+        # Initial election on startup
+        await self._start_election_if_needed()
+
         while True:
             try:
-                logging.info(
-                    "%s: starting election round (priority=%s)", self.id, self.priority
-                )
-                can_be_leader = await self.ElectionPhase()
-                if can_be_leader:
+                # Check if we have a leader
+                if not self.leader:
                     logging.info(
-                        "%s: ElectionPhase succeeded — attempting LeaderPhase", self.id
+                        "%s: no leader known, starting election", self.server_id
                     )
-                    success = await self.LeaderPhase()
-                    if success:
-                        self.leader = self.id
-                        logging.info(
-                            "%s: I am the new leader (priority=%s)",
-                            self.id,
-                            self.priority,
-                        )
-                        # pause a bit after announcing (avoid immediate re-election spam)
-                        await asyncio.sleep(LEADER_ANNOUNCE_PAUSE)
+                    await self._start_election_if_needed()
+                    await asyncio.sleep(ELECTION_COOLDOWN)
+                    continue
+
+                # Check if we're in an election
+                async with self._lock:
+                    election_in_progress = self._election_in_progress
+
+                if election_in_progress:
+                    logging.debug("%s: election in progress, waiting", self.server_id)
+                    await asyncio.sleep(ELECTION_COOLDOWN)
+                    continue
+
+                # Check leader health
+                leader_healthy = await self._check_leader_health()
+                if not leader_healthy:
+                    logging.info(
+                        "%s: leader %s appears to have failed, starting election",
+                        self.server_id,
+                        self.leader,
+                    )
+                    async with self._lock:
+                        self.leader = None
+                    await self._start_election_if_needed()
+                    await asyncio.sleep(ELECTION_COOLDOWN)
                 else:
-                    logging.info(
-                        "%s: not leader this round; sleeping before next check", self.id
-                    )
-                    # give leader a chance to announce, and don't hammer
-                    await asyncio.sleep(ELECTION_ROUND_INTERVAL)
-                    await self.RequestPhase()
+                    # Leader is healthy, wait before next check
+                    await asyncio.sleep(LEADER_CHECK_INTERVAL)
+
             except asyncio.CancelledError:
-                logging.info("%s: LifeCycle cancelled", self.id)
+                logging.info("%s: lifecycle cancelled", self.server_id)
                 raise
             except Exception as exc:
-                logging.exception(
-                    "%s: LifeCycle error (sleeping then retrying)",
-                    self.id,
-                    exc_info=exc,
-                )
-                await asyncio.sleep(ELECTION_ROUND_INTERVAL)
+                logging.exception("%s: lifecycle error, retrying", self.server_id)
+                await asyncio.sleep(ELECTION_COOLDOWN)
+
+    def get_current_leader(self) -> Optional[str]:
+        """Get the current leader (thread-safe)"""
+        return self.leader
+
+    def is_leader(self) -> bool:
+        """Check if this node is the current leader"""
+        return self.leader == self.server_id
+
+    def get_status(self) -> dict:
+        """Get current election status"""
+        return {
+            "server_id": self.server_id,
+            "priority": self.priority,
+            "current_leader": self.leader,
+            "is_leader": self.is_leader(),
+            "election_in_progress": self._election_in_progress,
+            "known_servers": list(self.known_servers.keys()),
+        }
