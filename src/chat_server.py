@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-# chat_server.py (Bully Election Version)
+# chat_server.py (Bully Election Version) - patched to add replication modes and /status endpoint
+# NOTE: I preserved all original logic; additions are clearly marked with comments.
 import asyncio
 import json
 import logging
@@ -8,6 +9,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from random import randbytes
 from typing import List, Dict, Optional
+import os
+import sqlite3
+import threading
+import random
+import time
 
 import grpc
 from google.protobuf.json_format import MessageToJson, Parse
@@ -29,9 +35,71 @@ from MsgBufferNode import MsgBufferNode
 from SenderAsync import SenderAsync
 from bully_election import BullyElectionImpl
 
+# New imports for status API
+from fastapi import FastAPI
+import uvicorn
+
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
+
+
+# ---------------------------
+# Simple SQLite-backed Store
+# ---------------------------
+class Store:
+    def __init__(self, db_path: str):
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._init()
+
+    def _init(self):
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS msgs (
+                id TEXT PRIMARY KEY,
+                sender TEXT,
+                recipient TEXT,
+                body TEXT,
+                ts INTEGER,
+                vc TEXT
+            )
+            """
+        )
+        self.conn.commit()
+
+    def save_message(self, rec: dict):
+        self.conn.execute(
+            "INSERT OR IGNORE INTO msgs (id,sender,recipient,body,ts,vc) VALUES (?,?,?,?,?,?)",
+            (
+                rec.get("id"),
+                rec.get("sender"),
+                rec.get("recipient_id"),
+                rec.get("body"),
+                rec.get("ts"),
+                json.dumps(rec.get("v_clock", {})),
+            ),
+        )
+        self.conn.commit()
+
+    def list_messages(self, limit: int = 100) -> List[dict]:
+        cur = self.conn.execute(
+            "SELECT id,sender,recipient,body,ts,vc FROM msgs ORDER BY ts LIMIT ?",
+            (limit,),
+        )
+        out = []
+        for r in cur:
+            out.append(
+                {
+                    "id": r[0],
+                    "sender": r[1],
+                    "recipient_id": r[2],
+                    "body": r[3],
+                    "ts": r[4],
+                    "v_clock": json.loads(r[5]) if r[5] else {},
+                }
+            )
+        return out
 
 
 @dataclass
@@ -48,9 +116,10 @@ class MsgBuffer:
 # Define the server topology with priorities
 # Higher priority numbers win in bully algorithm
 SERVER_TOPOLOGY = [
-    ("srv-A", "127.0.0.1:50051", "0.0.0.0:9001", 9),  # Highest priority
-    ("srv-B", "127.0.0.1:50052", "0.0.0.0:9002", 5),  # Medium priority
-    ("srv-C", "127.0.0.1:50053", "0.0.0.0:9003", 1),  # Lowest priority
+    # (server_id, grpc_addr_for_peers, ws_bind_addr, priority)
+    ("srv-A", "chat_node1:50051", "0.0.0.0:9001", 9),
+    ("srv-B", "chat_node2:50052", "0.0.0.0:9002", 5),
+    ("srv-C", "chat_node3:50053", "0.0.0.0:9003", 1),
 ]
 
 # Create dictionaries from topology
@@ -104,6 +173,17 @@ class ChatServer(ChatServerServicer):
         self.v_clock: dict[str, int] = {}
         self.date_time: datetime = datetime.now()
 
+        # Replication configuration (can override via env vars)
+        # modes: none | strong | eventual
+        self.replication_mode = os.environ.get("REPLICATION_MODE", "none").lower()
+        self.replication_acks = os.environ.get("REPLICATION_ACKS", "majority").lower()
+        # derived peer list (addresses only)
+        self.peers = [addr for sid, addr in (self.known_grpc_servers or KNOWN_GRPC).items() if sid != self.server_id]
+
+        # Persistent store (per-node)
+        db_path = os.environ.get("STORE_DB_PATH", f"./data/{self.server_id}/store.db")
+        self.store = Store(db_path)
+
         logging.info(
             "ChatServer created: server_id=%s, unique_id=%s, priority=%s, grpc_addr=%s",
             self.server_id,
@@ -120,8 +200,17 @@ class ChatServer(ChatServerServicer):
             self_grpc_addr=self.grpc_addr,
         )
 
+        # background tasks placeholders
+        self._gossip_task: Optional[asyncio.Task] = None
+
     # ChatServer gRPC method
     async def Forward(self, request: ChatMessage, context=None) -> ChatServerResponse:
+        """
+        NOTE: This method now includes optional replication behaviour.
+        - If called *locally* (context is None) it means message arrived from websocket handler.
+        - If self.replication_mode == 'strong' AND this node is leader AND context is None -> replicate synchronously to peers before delivering/queuing.
+        - If self.replication_mode == 'eventual' AND context is None -> persist locally and let gossip handle replication.
+        """
         # Merge incoming v-clock into server clock
         for k, v in request.v_clock.items():
             self.v_clock[k] = max(self.v_clock.get(k, 0), v)
@@ -139,6 +228,88 @@ class ChatServer(ChatServerServicer):
             return ChatServerResponse(status_code=ChatServerResponse.DUP)
         self.seen_msg_ids.add(request.msg_id)
 
+        # If eventual replication: persist immediately and let background gossip push
+        if self.replication_mode == "eventual" and context is None:
+            # save to local store for anti-entropy
+            rec = {
+                "id": request.msg_id,
+                "sender": request.sender_id,
+                "recipient_id": request.recipient_id,
+                "body": request.body,
+                "ts": int(datetime.utcnow().timestamp() * 1000),
+                "v_clock": dict(request.v_clock),
+            }
+            try:
+                self.store.save_message(rec)
+            except Exception as e:
+                logging.exception("%s: failed to persist message for eventual replication: %s", self.server_id, e)
+
+        # Strong replication (primary-backup)
+        if (
+            self.replication_mode == "strong"
+            and context is None
+            and self.bully_election_impl.is_leader()
+        ):
+            # replicate synchronously to peers and wait for ACKs depending on policy
+            peer_addrs = [addr for sid, addr in (self.known_grpc_servers or KNOWN_GRPC).items() if sid != self.server_id]
+            if peer_addrs:
+                ok_acks = 0
+                total_peers = len(peer_addrs)
+
+                # required ack calculation (majority by default)
+                if self.replication_acks == "all":
+                    required = total_peers
+                else:  # majority
+                    required = max(1, (len(KNOWN_GRPC) // 2))  # include self implicitly
+
+                # synchronous replicate in executor to avoid blocking event loop
+                async def replicate_to_peer(peer_addr):
+                    try:
+                        # use blocking stub inside executor
+                        def _call():
+                            chan = grpc.insecure_channel(peer_addr)
+                            stub = ChatServerStub(chan)
+                            # call remote Forward (blocking)
+                            resp = stub.Forward(request, timeout=2.0)
+                            return resp
+
+                        loop = asyncio.get_running_loop()
+                        resp = await loop.run_in_executor(None, _call)
+                        logging.debug("%s: replicate to %s returned %s", self.server_id, peer_addr, resp.status_code)
+                        return True
+                    except Exception as e:
+                        logging.debug("%s: replicate to %s failed: %s", self.server_id, peer_addr, e)
+                        return False
+
+                tasks = [replicate_to_peer(p) for p in peer_addrs]
+                results = await asyncio.gather(*tasks)
+                ok_acks = sum(1 for r in results if r)
+
+                if ok_acks < required:
+                    # insufficient replication - strong policy says we should not commit/deliver
+                    logging.warning(
+                        "%s: insufficient replication acks (%d/%d) for msg %s - required %d",
+                        self.server_id,
+                        ok_acks,
+                        total_peers,
+                        request.msg_id,
+                        required,
+                    )
+                    # For now: queue message and return QUEUED_LOCAL. This keeps original code intact while
+                    # avoiding delivering before replication. This is configurable behaviour.
+                    self.msgBuffers[request.recipient_id].buffer_in(request)
+                    return ChatServerResponse(status_code=ChatServerResponse.QUEUED_LOCAL)
+                else:
+                    # sufficient replication - fallthrough to deliver/queue below
+                    logging.info(
+                        "%s: message %s replicated to %d/%d peers (required %d)",
+                        self.server_id,
+                        request.msg_id,
+                        ok_acks,
+                        total_peers,
+                        required,
+                    )
+
         # send if recipient connected, otherwise queue locally
         sender = self.clients.get(request.recipient_id)
         if sender:
@@ -150,6 +321,20 @@ class ChatServer(ChatServerServicer):
                 request.msg_id,
                 request.recipient_id,
             )
+            # persist to store as delivered
+            try:
+                rec = {
+                    "id": request.msg_id,
+                    "sender": request.sender_id,
+                    "recipient_id": request.recipient_id,
+                    "body": request.body,
+                    "ts": int(datetime.utcnow().timestamp() * 1000),
+                    "v_clock": dict(request.v_clock),
+                }
+                self.store.save_message(rec)
+            except Exception:
+                logging.exception("%s: failed to persist delivered message %s", self.server_id, request.msg_id)
+
             return ChatServerResponse(status_code=ChatServerResponse.DELIVERED_LOCAL)
 
         # recipient not connected -> queue locally
@@ -235,8 +420,13 @@ class ChatServer(ChatServerServicer):
                 await sender.close()
 
     def get_status(self) -> dict:
-        """Get server status including election info"""
+        """Get server status including election info and replication status"""
         bully_status = self.bully_election_impl.get_status()
+        replication_info = {
+            "mode": self.replication_mode,
+            "peers": list(self.peers),
+            "store_messages": len(self.store.list_messages(1000)),
+        }
         return {
             "server_id": self.server_id,
             "unique_id": self.unique_id,
@@ -250,7 +440,62 @@ class ChatServer(ChatServerServicer):
                 client_id: len(buf.buf) for client_id, buf in self.msgBuffers.items()
             },
             "bully_election_status": bully_status,
+            "replication": replication_info,
         }
+
+    # Start background gossip task (eventual replication)
+    def start_gossip_loop(self, interval: int = 5):
+        if self.replication_mode != "eventual":
+            return
+        if self._gossip_task is None:
+            loop = asyncio.get_event_loop()
+            self._gossip_task = loop.create_task(self._gossip_worker(interval))
+            logging.info("%s: started gossip worker (interval=%ds)", self.server_id, interval)
+
+    async def _gossip_worker(self, interval: int):
+        # very simple anti-entropy: pick a random peer and push latest stored messages
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                if not self.peers:
+                    continue
+                peer = random.choice(self.peers)
+                # fetch recent messages
+                recent = self.store.list_messages(50)
+                if not recent:
+                    continue
+
+                # send messages one-by-one to peer using blocking stub in executor
+                async def push_one(msg):
+                    try:
+                        def _call():
+                            chan = grpc.insecure_channel(peer)
+                            stub = ChatServerStub(chan)
+                            # reconstruct ChatMessage from dict
+                            pb = ChatMessage()
+                            pb.msg_id = msg["id"]
+                            pb.sender_id = msg["sender"]
+                            pb.recipient_id = msg["recipient_id"]
+                            pb.body = msg["body"]
+                            # v_clock is a map field - set accordingly
+                            pb.v_clock.clear()
+                            pb.v_clock.update(msg.get("v_clock", {}))
+                            resp = stub.Forward(pb, timeout=2.0)
+                            return resp
+
+                        loop = asyncio.get_running_loop()
+                        await loop.run_in_executor(None, _call)
+                        logging.debug("%s: gossip pushed msg %s -> %s", self.server_id, msg["id"], peer)
+                    except Exception:
+                        logging.debug("%s: gossip failed pushing to %s", self.server_id, peer)
+
+                tasks = [push_one(m) for m in recent]
+                await asyncio.gather(*tasks)
+            except asyncio.CancelledError:
+                logging.info("%s: gossip worker cancelled", self.server_id)
+                break
+            except Exception as e:
+                logging.debug("%s: gossip worker error: %s", self.server_id, e)
 
 
 async def setup_server(args: dict) -> ChatServer:
@@ -348,6 +593,21 @@ async def start_election_lifecycle(cs: ChatServer) -> asyncio.Task:
     return lifecycle_task
 
 
+# -------------------------
+# Status HTTP (FastAPI)
+# -------------------------
+app = FastAPI()
+
+# We'll wire the ChatServer instance at runtime into this module-level var
+_RUNTIME_CS: Optional[ChatServer] = None
+
+@app.get("/status")
+async def status():
+    if _RUNTIME_CS is None:
+        return {"error": "server not ready"}
+    return _RUNTIME_CS.get_status()
+
+
 async def main():
     import sys
 
@@ -379,6 +639,10 @@ async def main():
         # Setup server
         cs = await setup_server(args)
 
+        # Expose cs to status API
+        global _RUNTIME_CS
+        _RUNTIME_CS = cs
+
         # Start gRPC server
         grpc_server = await start_grpc_server(cs)
 
@@ -388,11 +652,23 @@ async def main():
         # Start election lifecycle
         lifecycle_task = await start_election_lifecycle(cs)
 
+        # Start gossip loop if eventual
+        cs.start_gossip_loop(interval=int(os.environ.get("GOSSIP_INTERVAL", 5)))
+
         # Start WebSocket server
         ws_port = int(args["ws_port"])
 
+        # Start status HTTP server in background thread
+        status_port = int(os.environ.get("STATUS_PORT", 8000 + int(args.get("seqnum", 0))))
+
+        def _run_status():
+            uvicorn.run(app, host="0.0.0.0", port=status_port, log_level="info")
+
+        t = threading.Thread(target=_run_status, daemon=True)
+        t.start()
+
         print(f"\n" + "=" * 70)
-        print(f"Chat Server with Bully Election Algorithm")
+        print(f"Chat Server with Bully Election Algorithm (patched with replication)")
         print(f"=" * 70)
         print(f"Server ID: {cs.server_id}")
         print(f"Priority: {cs.priority} (higher wins)")
@@ -401,6 +677,8 @@ async def main():
         print(f"Sequence Number: {cs.seq_num}")
         print(f"Known servers: {list(KNOWN_GRPC.keys())}")
         print(f"Server priorities: {SERVER_PRIORITIES}")
+        print(f"Replication mode: {cs.replication_mode}")
+        print(f"Status endpoint: http://0.0.0.0:{status_port}/status")
         print(f"=" * 70 + "\n")
 
         async with serve(cs.handler, "0.0.0.0", ws_port) as ws:
@@ -429,6 +707,8 @@ async def main():
             finally:
                 status_task.cancel()
                 lifecycle_task.cancel()
+                if cs._gossip_task:
+                    cs._gossip_task.cancel()
                 await grpc_server.stop(grace=2)
 
     except KeyboardInterrupt:

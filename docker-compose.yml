@@ -1,0 +1,54 @@
+services:
+  node1:
+    build: .
+    container_name: chat_node1
+    environment:
+      NODE_ID: node1
+      REPLICATION_MODE: strong
+    command: >
+      python src/chat_server.py
+      --ws_port 9001
+      --grpc_port 50051
+      --seqnum 1
+    ports:
+      - "8001:8001"
+      - "9001:9001"
+      - "50051:50051"
+    volumes:
+      - ./data/node1:/app/data
+
+  node2:
+    build: .
+    container_name: chat_node2
+    environment:
+      NODE_ID: node2
+      REPLICATION_MODE: strong
+    command: >
+      python src/chat_server.py
+      --ws_port 9002
+      --grpc_port 50052
+      --seqnum 2
+    ports:
+      - "8002:8002"
+      - "9002:9002"
+      - "50052:50052"
+    volumes:
+      - ./data/node2:/app/data
+
+  node3:
+    build: .
+    container_name: chat_node3
+    environment:
+      NODE_ID: node3
+      REPLICATION_MODE: strong
+    command: >
+      python src/chat_server.py
+      --ws_port 9003
+      --grpc_port 50053
+      --seqnum 3
+    ports:
+      - "8003:8003"
+      - "9003:9003"
+      - "50053:50053"
+    volumes:
+      - ./data/node3:/app/data

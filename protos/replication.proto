@@ -1,0 +1,33 @@
+syntax = "proto3";
+package replication;
+
+import "google/protobuf/empty.proto";
+
+message VectorClock {
+  map<string, int64> clock = 1;
+}
+
+message ChatMessage {
+  string id = 1;           // uuid
+  string sender = 2;
+  string body = 3;
+  int64 ts = 4;            // unix ms
+  VectorClock vc = 5;
+}
+
+message ReplicateRequest {
+  ChatMessage msg = 1;
+  string origin_node = 2;
+}
+
+message ReplicateResponse {
+  bool ok = 1;
+  string reason = 2;
+}
+
+service Replication {
+  // Primary -> backup replication (synchronous or asynchronous depending on caller)
+  rpc Replicate(ReplicateRequest) returns (ReplicateResponse);
+  // Optional: fetch missing messages (anti-entropy)
+  rpc FetchMissing(google.protobuf.Empty) returns (stream ChatMessage);
+}
