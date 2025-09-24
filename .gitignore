@@ -1,3 +1,6 @@
 .venv
 .mypy_cache
 *pycache*
+data/*/*.db
+data/*/*/store.db
+*.db

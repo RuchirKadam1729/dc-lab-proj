@@ -1,11 +1,11 @@
 import grpc
-from .src.ChatServer_pb2 import ChatMessage
-from .src.ChatServer_pb2_grpc import ChatServerStub
+from ChatServer_pb2 import ChatMessage
+from ChatServer_pb2_grpc import ChatServerStub
 from google.protobuf.timestamp_pb2 import Timestamp
 import time
 
 def send_message():
-    channel = grpc.insecure_channel('localhost:50051')  # Connect to leader node (srv-A)
+    channel = grpc.insecure_channel('localhost:50051')  
     stub = ChatServerStub(channel)
 
     # Create a Timestamp for current time
@@ -13,11 +13,11 @@ def send_message():
     timestamp.GetCurrentTime()
 
     message = ChatMessage(
-        msg_id="test-msg-001",
-        sender_id="client-1",
-        recipient_id="client-2",
-        payload="Hello, this is a replication test!",  # Correct field name (not 'message')
-        v_clock={"srv-A": 2},
+        msg_id="test-msg-007",
+        sender_id="client-2",
+        recipient_id="client-4",
+        payload="Ei-chan !",  
+        v_clock={"srv-C": 4},
         date_time=timestamp
     )
 

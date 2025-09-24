@@ -27,7 +27,6 @@ from ChatServer_pb2_grpc import (
     add_ChatServerServicer_to_server,
 )
 
-# Bully election servicer registration
 from BullyElection_pb2_grpc import add_BullyElectionServicer_to_server
 
 # local modules - ensure these exist in your project
@@ -211,6 +210,18 @@ class ChatServer(ChatServerServicer):
         - If self.replication_mode == 'strong' AND this node is leader AND context is None -> replicate synchronously to peers before delivering/queuing.
         - If self.replication_mode == 'eventual' AND context is None -> persist locally and let gossip handle replication.
         """
+        # detect replication RPC via metadata (so we can allow client gRPC to trigger replication)
+        is_replication_rpc = False
+        if context is not None:
+            try:
+                md = dict(context.invocation_metadata() or [])
+                # metadata keys are lowercased by gRPC; we look for 'replica' == '1'
+                if md.get("replica") == "1":
+                    is_replication_rpc = True
+            except Exception:
+                # tolerate any introspection errors by treating as non-replication RPC
+                is_replication_rpc = False
+
         # Merge incoming v-clock into server clock
         for k, v in request.v_clock.items():
             self.v_clock[k] = max(self.v_clock.get(k, 0), v)
@@ -231,11 +242,12 @@ class ChatServer(ChatServerServicer):
         # If eventual replication: persist immediately and let background gossip push
         if self.replication_mode == "eventual" and context is None:
             # save to local store for anti-entropy
+            body_val = getattr(request, "payload", None)
             rec = {
                 "id": request.msg_id,
                 "sender": request.sender_id,
                 "recipient_id": request.recipient_id,
-                "body": request.body,
+                "body": body_val,
                 "ts": int(datetime.utcnow().timestamp() * 1000),
                 "v_clock": dict(request.v_clock),
             }
@@ -247,7 +259,7 @@ class ChatServer(ChatServerServicer):
         # Strong replication (primary-backup)
         if (
             self.replication_mode == "strong"
-            and context is None
+            and not is_replication_rpc
             and self.bully_election_impl.is_leader()
         ):
             # replicate synchronously to peers and wait for ACKs depending on policy
@@ -260,32 +272,57 @@ class ChatServer(ChatServerServicer):
                 if self.replication_acks == "all":
                     required = total_peers
                 else:  # majority
-                    required = max(1, (len(KNOWN_GRPC) // 2))  # include self implicitly
+                    total_nodes = len(KNOWN_GRPC)
+                    required = (total_nodes // 2) + 1
+                    required_acks_from_peers = max(0, required - 1)
 
                 # synchronous replicate in executor to avoid blocking event loop
                 async def replicate_to_peer(peer_addr):
-                    try:
-                        # use blocking stub inside executor
-                        def _call():
-                            chan = grpc.insecure_channel(peer_addr)
-                            stub = ChatServerStub(chan)
-                            # call remote Forward (blocking)
-                            resp = stub.Forward(request, timeout=2.0)
-                            return resp
-
-                        loop = asyncio.get_running_loop()
-                        resp = await loop.run_in_executor(None, _call)
-                        logging.debug("%s: replicate to %s returned %s", self.server_id, peer_addr, resp.status_code)
-                        return True
-                    except Exception as e:
-                        logging.debug("%s: replicate to %s failed: %s", self.server_id, peer_addr, e)
-                        return False
+                  try:
+                      def _call():
+                          chan = grpc.insecure_channel(peer_addr)
+                          stub = ChatServerStub(chan)
+                          # increase timeout and get response
+                          # mark the outgoing RPC as replication via metadata to avoid re-replication loops
+                          resp = stub.Forward(request, timeout=5.0, metadata=(('replica','1'),))
+                          return resp
+              
+                      loop = asyncio.get_running_loop()
+                      resp = await loop.run_in_executor(None, _call)
+              
+                      # log the response from the peer
+                      logging.info(
+                          "%s: replicate to %s returned status=%s payload=%s",
+                          self.server_id,
+                          peer_addr,
+                          getattr(resp, "status_code", None),
+                          getattr(resp, "payload", None),
+                      )
+              
+                      # consider replication successful only if peer persisted or already has it (DUP)
+                      accepted = {
+                          ChatServerResponse.DELIVERED_LOCAL,
+                          ChatServerResponse.QUEUED_LOCAL,
+                          ChatServerResponse.DELIVERED_REMOTE,
+                          ChatServerResponse.QUEUED_REMOTE,
+                          ChatServerResponse.QUEUED_FALLBACK,
+                          ChatServerResponse.DUP,
+                      }
+                      if getattr(resp, "status_code", None) in accepted:
+                          return True
+                      logging.warning("%s: replicate to %s returned non-persistent status %s", self.server_id, peer_addr, getattr(resp, "status_code", None))
+                      return False
+                  except Exception as e:
+                      logging.exception("%s: replicate to %s failed: %s", self.server_id, peer_addr, e)
+                      return False
 
                 tasks = [replicate_to_peer(p) for p in peer_addrs]
                 results = await asyncio.gather(*tasks)
                 ok_acks = sum(1 for r in results if r)
+                required = (len(KNOWN_GRPC) // 2) + 1
+                required_from_peers = max(0, required - 1)
 
-                if ok_acks < required:
+                if ok_acks < required_from_peers:
                     # insufficient replication - strong policy says we should not commit/deliver
                     logging.warning(
                         "%s: insufficient replication acks (%d/%d) for msg %s - required %d",
@@ -295,20 +332,37 @@ class ChatServer(ChatServerServicer):
                         request.msg_id,
                         required,
                     )
-                    # For now: queue message and return QUEUED_LOCAL. This keeps original code intact while
-                    # avoiding delivering before replication. This is configurable behaviour.
+
+                    # Persist the message so queued messages survive restarts/crashes
+                    body_val = getattr(request, "payload", None)
+                    rec = {
+                        "id": request.msg_id,
+                        "sender": request.sender_id,
+                        "recipient_id": request.recipient_id,
+                        "body": body_val,
+                        "ts": int(datetime.utcnow().timestamp() * 1000),
+                        "v_clock": dict(request.v_clock),
+                    }
+                    try:
+                        self.store.save_message(rec)
+                    except Exception as e:
+                        logging.exception("%s: failed to persist queued (insufficient-acks) message %s: %s", self.server_id, request.msg_id, e)
+
+                    # Queue in memory for delivery when available
                     self.msgBuffers[request.recipient_id].buffer_in(request)
                     return ChatServerResponse(status_code=ChatServerResponse.QUEUED_LOCAL)
                 else:
                     # sufficient replication - fallthrough to deliver/queue below
                     logging.info(
-                        "%s: message %s replicated to %d/%d peers (required %d)",
-                        self.server_id,
-                        request.msg_id,
-                        ok_acks,
-                        total_peers,
-                        required,
+                           "%s: Forward called; msg_id=%s sender=%s recipient=%s payload=%s v_clock=%s",
+                           self.server_id,
+                           getattr(request, "msg_id", None),
+                           getattr(request, "sender_id", None),
+                           getattr(request, "recipient_id", None),
+                           getattr(request, "payload", None),
+                           dict(request.v_clock),
                     )
+                    logging.debug("%s: Forward request JSON: %s", self.server_id, MessageToJson(request))
 
         # send if recipient connected, otherwise queue locally
         sender = self.clients.get(request.recipient_id)
@@ -323,11 +377,12 @@ class ChatServer(ChatServerServicer):
             )
             # persist to store as delivered
             try:
+                body_val = getattr(request, "payload", None)
                 rec = {
                     "id": request.msg_id,
                     "sender": request.sender_id,
                     "recipient_id": request.recipient_id,
-                    "body": request.body,
+                    "body": body_val,
                     "ts": int(datetime.utcnow().timestamp() * 1000),
                     "v_clock": dict(request.v_clock),
                 }
@@ -337,7 +392,21 @@ class ChatServer(ChatServerServicer):
 
             return ChatServerResponse(status_code=ChatServerResponse.DELIVERED_LOCAL)
 
-        # recipient not connected -> queue locally
+        # recipient not connected -> persist + queue locally
+        body_val = getattr(request, "payload", None)
+        rec = {
+            "id": request.msg_id,
+            "sender": request.sender_id,
+            "recipient_id": request.recipient_id,
+            "body": body_val,
+            "ts": int(datetime.utcnow().timestamp() * 1000),
+            "v_clock": dict(request.v_clock),
+        }
+        try:
+            self.store.save_message(rec)
+        except Exception:
+            logging.exception("%s: failed to persist queued message %s", self.server_id, request.msg_id)
+
         self.msgBuffers[request.recipient_id].buffer_in(request)
         logging.info(
             "%s: queued message %s for client %s",
@@ -476,7 +545,8 @@ class ChatServer(ChatServerServicer):
                             pb.msg_id = msg["id"]
                             pb.sender_id = msg["sender"]
                             pb.recipient_id = msg["recipient_id"]
-                            pb.body = msg["body"]
+                            # payload field in proto
+                            pb.payload = msg.get("body", "")
                             # v_clock is a map field - set accordingly
                             pb.v_clock.clear()
                             pb.v_clock.update(msg.get("v_clock", {}))
@@ -667,7 +737,7 @@ async def main():
         t = threading.Thread(target=_run_status, daemon=True)
         t.start()
 
-        print(f"\n" + "=" * 70)
+        print(f"" + "=" * 70)
         print(f"Chat Server with Bully Election Algorithm (patched with replication)")
         print(f"=" * 70)
         print(f"Server ID: {cs.server_id}")
@@ -679,7 +749,7 @@ async def main():
         print(f"Server priorities: {SERVER_PRIORITIES}")
         print(f"Replication mode: {cs.replication_mode}")
         print(f"Status endpoint: http://0.0.0.0:{status_port}/status")
-        print(f"=" * 70 + "\n")
+        print(f"=" * 70 + "")
 
         async with serve(cs.handler, "0.0.0.0", ws_port) as ws:
             logging.info(
