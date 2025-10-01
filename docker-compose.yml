@@ -52,3 +52,18 @@ services:
       - "50053:50053"
     volumes:
       - ./data/node3:/app/data
+
+  lb:
+    build: .
+    container_name: chat_lb
+    environment:
+      LB_NODES: "http://chat_node1:8001,http://chat_node2:8002,http://chat_node3:8003"
+      LB_POLL_INTERVAL: "2"
+    command: uvicorn src.load_balancer:app --host 0.0.0.0 --port 80 --loop asyncio --workers 1
+    ports:
+      - "8080:80"   
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/lb/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
