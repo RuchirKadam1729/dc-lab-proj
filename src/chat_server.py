@@ -20,6 +20,7 @@ from google.protobuf.json_format import MessageToJson, Parse
 from google.protobuf.empty_pb2 import Empty
 from websockets.asyncio.server import serve
 
+# gRPC protos
 from ChatServer_pb2 import ChatMessage, ChatServerResponse
 from ChatServer_pb2_grpc import (
     ChatServerServicer,
@@ -34,9 +35,106 @@ from MsgBufferNode import MsgBufferNode
 from SenderAsync import SenderAsync
 from bully_election import BullyElectionImpl
 
-# New imports for status API
+# New imports for status API (original)
 from fastapi import FastAPI
 import uvicorn
+
+# ----- PRIMARY-BACKUP ADDITIONS (paste after existing imports) -----
+from fastapi import FastAPI, Body
+from fastapi.responses import JSONResponse
+from uuid import uuid4
+import httpx
+
+# Job states
+class JobState:
+    def __init__(self):
+        self.job_id: Optional[str] = None
+        self.phase: str = "idle"   # idle | replicated | processing | finished | failed
+        self.started_at: Optional[float] = None
+        self.processing_ms: int = 0
+        self.result: Optional[str] = None
+
+# Simple thread-safe wrapper for job processing
+class JobProcessor:
+    def __init__(self):
+        # The async lock is used if any async code wants to await; thread_lock for threads.
+        self._lock = asyncio.Lock()
+        self._thread_lock = threading.Lock()
+        self.state = JobState()
+
+    def start_job_thread(self, processing_ms: int, role_update_cb=None, job_id: Optional[str] = None):
+        """Start job in a background thread to simulate long processing"""
+        with self._thread_lock:
+            if self.state.phase in ("processing", "replicated"):
+                # Already processing
+                return False, "already_processing"
+            self.state.job_id = job_id or uuid4().hex
+            self.state.phase = "processing"
+            self.state.started_at = time.time()
+            self.state.processing_ms = processing_ms
+            self.state.result = None
+
+            def _run():
+                try:
+                    # sleep to simulate long processing (we use smaller sleeps so monitor can intervene)
+                    remaining = processing_ms / 1000.0
+                    slice_sec = 0.5
+                    while remaining > 0:
+                        time.sleep(min(slice_sec, remaining))
+                        remaining -= slice_sec
+                    self.state.phase = "finished"
+                    self.state.result = f"completed (proc_ms={processing_ms})"
+                    # call callback if provided (e.g., to signal promotion policy)
+                    if role_update_cb:
+                        try:
+                            role_update_cb()
+                        except Exception:
+                            pass
+                except Exception as ex:
+                    self.state.phase = "failed"
+                    self.state.result = f"failed: {ex}"
+
+            t = threading.Thread(target=_run, daemon=True)
+            t.start()
+            return True, self.state.job_id
+
+    def accept_replicated_job(self, processing_ms: int, job_id: Optional[str] = None):
+        """Backup accepts replication and starts processing concurrently."""
+        with self._thread_lock:
+            # If already processing same job, ignore
+            if self.state.job_id == job_id and self.state.phase == "processing":
+                return True, self.state.job_id
+            self.state.job_id = job_id or uuid4().hex
+            self.state.phase = "processing"
+            self.state.started_at = time.time()
+            self.state.processing_ms = processing_ms
+            self.state.result = None
+            # start background same as above
+            def _run():
+                try:
+                    remaining = processing_ms / 1000.0
+                    slice_sec = 0.5
+                    while remaining > 0:
+                        time.sleep(min(slice_sec, remaining))
+                        remaining -= slice_sec
+                    self.state.phase = "finished"
+                    self.state.result = f"completed (proc_ms={processing_ms})"
+                except Exception as ex:
+                    self.state.phase = "failed"
+                    self.state.result = f"failed: {ex}"
+            t = threading.Thread(target=_run, daemon=True)
+            t.start()
+            return True, self.state.job_id
+
+    def get_status(self):
+        return {
+            "job_id": self.state.job_id,
+            "phase": self.state.phase,
+            "started_at": self.state.started_at,
+            "processing_ms": self.state.processing_ms,
+            "result": self.state.result,
+        }
+# -------------------------------------------------------------------
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -171,6 +269,22 @@ class ChatServer(ChatServerServicer):
         self.seq_num = seq_num
         self.v_clock: dict[str, int] = {}
         self.date_time: datetime = datetime.now()
+
+        # ----- primary-backup fields -----
+        # role: "primary", "backup", "monitor" (default assigned by topology / CLI)
+        self.role: str = "primary" if server_id == "srv-A" else ("backup" if server_id == "srv-B" else "monitor")
+        # job processor handles simulated long-running jobs and replicated acceptance
+        self._job_processor = JobProcessor()
+        # a simple flag used by monitor to know whether this node is alive/unresponsive
+        self.last_heartbeat = time.time()
+        # control port for PB HTTP API (computed from grpc_port to avoid collisions)
+        # if you pass --control_port in args, it will override this default
+        try:
+            self.control_port = int(self.grpc_addr.split(":")[1]) + 3000
+        except Exception:
+            self.control_port = None
+        # Note: prefer explicit control_port via CLI/docker-compose; above is fallback.
+        # -------------------------------------------------------
 
         # Replication configuration (can override via env vars)
         # modes: none | strong | eventual
@@ -496,6 +610,12 @@ class ChatServer(ChatServerServicer):
             "peers": list(self.peers),
             "store_messages": len(self.store.list_messages(1000)),
         }
+        # include primary-backup job status
+        pb_job = None
+        try:
+            pb_job = self._job_processor.get_status()
+        except Exception:
+            pb_job = None
         return {
             "server_id": self.server_id,
             "unique_id": self.unique_id,
@@ -510,6 +630,11 @@ class ChatServer(ChatServerServicer):
             },
             "bully_election_status": bully_status,
             "replication": replication_info,
+            "pb": {
+                "role": self.role,
+                "job": pb_job,
+                "control_port": self.control_port,
+            },
         }
 
     # Start background gossip task (eventual replication)
@@ -678,6 +803,116 @@ async def status():
     return _RUNTIME_CS.get_status()
 
 
+# ----------------- PRIMARY-BACKUP CONTROL HTTP API -----------------
+pb_app = FastAPI(title="PrimaryBackup-Control")
+
+@pb_app.get("/pb/status")
+async def pb_status():
+    # return role and job status
+    cs_obj = globals().get("cs")
+    if not cs_obj:
+        return JSONResponse({"error": "server not ready"}, status_code=503)
+    return JSONResponse({
+        "server_id": cs_obj.server_id,
+        "role": cs_obj.role,
+        "job": cs_obj._job_processor.get_status(),
+        "time": time.time(),
+    })
+
+@pb_app.post("/pb/set_role")
+async def pb_set_role(payload: dict = Body(...)):
+    # payload: {"role": "primary" | "backup" | "monitor"}
+    cs_obj = globals().get("cs")
+    if not cs_obj:
+        return JSONResponse({"error": "server not ready"}, status_code=503)
+    new_role = payload.get("role")
+    if new_role not in ("primary", "backup", "monitor"):
+        return JSONResponse({"error": "invalid role"}, status_code=400)
+    cs_obj.role = new_role
+    return {"ok": True, "role": cs_obj.role}
+
+@pb_app.post("/pb/forward_job")
+async def pb_forward_job(payload: dict = Body(...)):
+    """
+    Called by primary to forward/replicate a job to this backup node.
+    payload: {"job_id": "...", "processing_ms": int}
+    Backup accepts and immediately starts processing; reply ack.
+    """
+    cs_obj = globals().get("cs")
+    if not cs_obj:
+        return JSONResponse({"error": "server not ready"}, status_code=503)
+    job_id = payload.get("job_id")
+    processing_ms = int(payload.get("processing_ms", 0))
+    # Only backups accept forwarded jobs (or primaries acting as backup in some topologies)
+    accepted, jid = cs_obj._job_processor.accept_replicated_job(processing_ms=processing_ms, job_id=job_id)
+    if not accepted:
+        return JSONResponse({"ok": False, "reason": "cannot_accept"}, status_code=503)
+    return {"ok": True, "job_id": jid}
+
+@pb_app.post("/pb/start_job")
+async def pb_start_job(payload: dict = Body(...)):
+    """
+    Client asks this node to start a long job.
+    - If primary: forward to backup, wait for ack of replication, then start processing (simulate).
+    - If backup or monitor: return redirect info to client (who should talk to primary)
+    payload: {"processing_ms": <ms>}
+    """
+    cs_obj = globals().get("cs")
+    if not cs_obj:
+        return JSONResponse({"error": "server not ready"}, status_code=503)
+    processing_ms = int(payload.get("processing_ms", 120000))  # ms; default 120000 (2 min)
+    # If this node is primary -> forward to backup first
+    if cs_obj.role != "primary":
+        # return the current primary (ask other nodes via known_grpc) so client can retry
+        current_primary = cs_obj.bully_election_impl.get_current_leader()
+        return JSONResponse({"ok": False, "reason": "not_primary", "primary": current_primary}, status_code=409)
+
+    # find backup (simple selection: any known server that is not this server)
+    backup = None
+    backup_grpc = None
+    for sid, gaddr in cs_obj.known_grpc_servers.items():
+        if sid != cs_obj.server_id:
+            backup = sid
+            backup_grpc = gaddr
+            break
+    if not backup:
+        return JSONResponse({"ok": False, "reason": "no_backup"}, status_code=503)
+
+    # Forward replication to backup -> call its control endpoint
+    try:
+        # Derive backup host (we expect known_grpc_servers entries like "chat_node2:50052")
+        b_addr = (cs_obj.known_grpc_servers.get(backup) or cs_obj.known_ws_servers.get(backup))
+        if not b_addr:
+            return JSONResponse({"ok": False, "reason": "no_backup_addr"}, status_code=500)
+        b_host = b_addr.split(":")[0]
+        backup_control_port = cs_obj.control_port
+        if backup_control_port is None:
+            return JSONResponse({"ok": False, "reason": "no_control_port_configured"}, status_code=500)
+        forward_url = f"http://{b_host}:{backup_control_port}/pb/forward_job"
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(forward_url, json={"job_id": uuid4().hex, "processing_ms": processing_ms})
+            if resp.status_code != 200:
+                return JSONResponse({"ok": False, "reason": "backup_reject", "status": resp.text}, status_code=502)
+            data = resp.json()
+            # if acked by backup, start processing locally
+            ok, jid = cs_obj._job_processor.start_job_thread(processing_ms=processing_ms, job_id=data.get("job_id"))
+            return {"ok": True, "replicated_to": backup, "job_id": jid}
+    except Exception as ex:
+        return JSONResponse({"ok": False, "reason": "forward_error", "error": str(ex)}, status_code=502)
+
+# Helper to run pb_app as background uvicorn in this container if control_port provided as CLI arg
+def start_pb_control_server(control_port):
+    if not control_port:
+        logging.info("PB control server not started (no control_port provided)")
+        return
+    # run uvicorn server in background thread
+    def _run():
+        uvicorn.run(pb_app, host="0.0.0.0", port=int(control_port), log_level="info")
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    logging.info("Started PB control server on port %s", control_port)
+# -------------------------------------------------------------------
+
 async def main():
     import sys
 
@@ -687,7 +922,7 @@ async def main():
     while i < len(sys.argv) - 1:
         arg = sys.argv[i]
         next_arg = sys.argv[i + 1]
-        if arg in ["--ws_port", "--grpc_port", "--priority", "--seqnum"]:
+        if arg in ["--ws_port", "--grpc_port", "--priority", "--seqnum", "--control_port"]:
             args[arg[2:]] = next_arg  # Remove -- prefix
             i += 2
         else:
@@ -698,7 +933,7 @@ async def main():
     if missing_args:
         print(f"Missing required arguments: {missing_args}")
         print(
-            "Usage: python chat_server.py --ws_port PORT --grpc_port PORT [--priority NUM] --seqnum NUM"
+            "Usage: python chat_server.py --ws_port PORT --grpc_port PORT [--priority NUM] --seqnum NUM [--control_port PORT]"
         )
         print(
             "Note: If priority is not specified, default priority for the server will be used"
@@ -712,6 +947,20 @@ async def main():
         # Expose cs to status API
         global _RUNTIME_CS
         _RUNTIME_CS = cs
+
+        # Expose to PB endpoints too (global variable name 'cs')
+        globals()['cs'] = cs
+
+        # If control_port passed via CLI, override cs.control_port
+        control_port_arg = args.get("control_port")
+        if control_port_arg:
+            try:
+                cs.control_port = int(control_port_arg)
+            except Exception:
+                logging.warning("Invalid control_port provided, ignoring")
+
+        # start PB control server (only if cs.control_port configured)
+        start_pb_control_server(cs.control_port)
 
         # Start gRPC server
         grpc_server = await start_grpc_server(cs)
@@ -738,10 +987,11 @@ async def main():
         t.start()
 
         print(f"" + "=" * 70)
-        print(f"Chat Server with Bully Election Algorithm (patched with replication)")
+        print(f"Chat Server with Bully Election Algorithm (patched with replication + PB)")
         print(f"=" * 70)
         print(f"Server ID: {cs.server_id}")
         print(f"Priority: {cs.priority} (higher wins)")
+        print(f"Role: {cs.role}")
         print(f"WebSocket: ws://0.0.0.0:{ws_port}")
         print(f"gRPC: {cs.grpc_addr}")
         print(f"Sequence Number: {cs.seq_num}")
@@ -749,6 +999,8 @@ async def main():
         print(f"Server priorities: {SERVER_PRIORITIES}")
         print(f"Replication mode: {cs.replication_mode}")
         print(f"Status endpoint: http://0.0.0.0:{status_port}/status")
+        if cs.control_port:
+            print(f"PB control endpoint: http://0.0.0.0:{cs.control_port}/pb/status")
         print(f"=" * 70 + "")
 
         async with serve(cs.handler, "0.0.0.0", ws_port) as ws:

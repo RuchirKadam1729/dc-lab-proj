@@ -10,10 +10,12 @@ services:
       --ws_port 9001
       --grpc_port 50051
       --seqnum 1
+      --control_port 8101
     ports:
-      - "8001:8001"
-      - "9001:9001"
-      - "50051:50051"
+      - "8001:8001"   # status HTTP port (uvicorn started by server uses 8000 + seqnum by default)
+      - "9001:9001"   # websocket
+      - "50051:50051" # gRPC
+      - "8101:8101"   # PB control HTTP API (primary/backup control)
     volumes:
       - ./data/node1:/app/data
 
@@ -28,10 +30,12 @@ services:
       --ws_port 9002
       --grpc_port 50052
       --seqnum 2
+      --control_port 8102
     ports:
       - "8002:8002"
       - "9002:9002"
       - "50052:50052"
+      - "8102:8102"
     volumes:
       - ./data/node2:/app/data
 
@@ -46,10 +50,12 @@ services:
       --ws_port 9003
       --grpc_port 50053
       --seqnum 3
+      --control_port 8103
     ports:
       - "8003:8003"
       - "9003:9003"
       - "50053:50053"
+      - "8103:8103"
     volumes:
       - ./data/node3:/app/data
 
@@ -61,9 +67,13 @@ services:
       LB_POLL_INTERVAL: "2"
     command: uvicorn src.load_balancer:app --host 0.0.0.0 --port 80 --loop asyncio --workers 1
     ports:
-      - "8080:80"   
+      - "8080:80"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:80/lb/health"]
       interval: 10s
       timeout: 3s
       retries: 3
+
+networks:
+  default:
+    name: chat_network
