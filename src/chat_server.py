@@ -860,45 +860,92 @@ async def pb_start_job(payload: dict = Body(...)):
     cs_obj = globals().get("cs")
     if not cs_obj:
         return JSONResponse({"error": "server not ready"}, status_code=503)
-    processing_ms = int(payload.get("processing_ms", 120000))  # ms; default 120000 (2 min)
-    # If this node is primary -> forward to backup first
+
+    processing_ms = int(payload.get("processing_ms", 120000))  # default 2 minutes
+
+    # If this node is not the primary, tell client where the primary is
     if cs_obj.role != "primary":
-        # return the current primary (ask other nodes via known_grpc) so client can retry
         current_primary = cs_obj.bully_election_impl.get_current_leader()
         return JSONResponse({"ok": False, "reason": "not_primary", "primary": current_primary}, status_code=409)
 
-    # find backup (simple selection: any known server that is not this server)
-    backup = None
-    backup_grpc = None
+    # choose a backup (simple: first peer different from self)
+    backup_sid = None
+    backup_addr = None
     for sid, gaddr in cs_obj.known_grpc_servers.items():
         if sid != cs_obj.server_id:
-            backup = sid
-            backup_grpc = gaddr
+            backup_sid = sid
+            backup_addr = gaddr
             break
-    if not backup:
+    if not backup_sid or not backup_addr:
         return JSONResponse({"ok": False, "reason": "no_backup"}, status_code=503)
 
-    # Forward replication to backup -> call its control endpoint
+    b_host = backup_addr.split(":")[0]
+
+    # Discover backup control_port by querying its /status endpoint
+    backup_control_port = None
+    tried = []
+    # try container hostname status port (we assume status is at 8000 + seqnum like your server prints)
     try:
-        # Derive backup host (we expect known_grpc_servers entries like "chat_node2:50052")
-        b_addr = (cs_obj.known_grpc_servers.get(backup) or cs_obj.known_ws_servers.get(backup))
-        if not b_addr:
-            return JSONResponse({"ok": False, "reason": "no_backup_addr"}, status_code=500)
-        b_host = b_addr.split(":")[0]
-        backup_control_port = cs_obj.control_port
-        if backup_control_port is None:
-            return JSONResponse({"ok": False, "reason": "no_control_port_configured"}, status_code=500)
-        forward_url = f"http://{b_host}:{backup_control_port}/pb/forward_job"
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(forward_url, json={"job_id": uuid4().hex, "processing_ms": processing_ms})
-            if resp.status_code != 200:
-                return JSONResponse({"ok": False, "reason": "backup_reject", "status": resp.text}, status_code=502)
-            data = resp.json()
-            # if acked by backup, start processing locally
-            ok, jid = cs_obj._job_processor.start_job_thread(processing_ms=processing_ms, job_id=data.get("job_id"))
-            return {"ok": True, "replicated_to": backup, "job_id": jid}
-    except Exception as ex:
-        return JSONResponse({"ok": False, "reason": "forward_error", "error": str(ex)}, status_code=502)
+        # compute seqindex -> status port heuristic: 8000 + seqnum
+        # find index by matching backup_sid in KNOWN_GRPC ordering
+        idx = list(KNOWN_GRPC.keys()).index(backup_sid)  # 0-based
+        status_port = 8000 + (idx + 1)
+        status_url = f"http://{b_host}:{status_port}/status"
+        tried.append(status_url)
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            r = await client.get(status_url)
+            if r.status_code == 200:
+                s = r.json()
+                backup_control_port = s.get("pb", {}).get("control_port")
+    except Exception:
+        backup_control_port = None
+
+    # fallback: try localhost mapped status port (useful if you mapped ports on host)
+    if not backup_control_port:
+        try:
+            status_port = 8000 + (list(KNOWN_GRPC.keys()).index(backup_sid) + 1)
+            status_url = f"http://localhost:{status_port}/status"
+            tried.append(status_url)
+            async with httpx.AsyncClient(timeout=2.0) as client:
+                r = await client.get(status_url)
+                if r.status_code == 200:
+                    s = r.json()
+                    backup_control_port = s.get("pb", {}).get("control_port")
+        except Exception:
+            backup_control_port = None
+
+    if not backup_control_port:
+        return JSONResponse({
+            "ok": False,
+            "reason": "no_backup_control_port",
+            "tried_status_urls": tried
+        }, status_code=500)
+
+    # Try forwarding to backup's /pb/forward_job
+    forward_urls = [
+        f"http://{b_host}:{backup_control_port}/pb/forward_job",  # container network
+        f"http://localhost:{backup_control_port}/pb/forward_job"  # host-mapped fallback
+    ]
+    last_err = None
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        for furl in forward_urls:
+            try:
+                resp = await client.post(furl, json={"job_id": uuid4().hex, "processing_ms": processing_ms})
+                if resp.status_code == 200:
+                    data = resp.json()
+                    ok, jid = cs_obj._job_processor.start_job_thread(processing_ms=processing_ms, job_id=data.get("job_id"))
+                    return {"ok": True, "replicated_to": backup_sid, "job_id": jid}
+                else:
+                    # keep trying next forward url
+                    try:
+                        body = resp.json()
+                    except Exception:
+                        body = resp.text
+                    last_err = f"non-200 {resp.status_code} -> {body}"
+            except Exception as ex:
+                last_err = str(ex)
+
+    return JSONResponse({"ok": False, "reason": "forward_error", "error": last_err, "forward_urls_tried": forward_urls}, status_code=502)
 
 # Helper to run pb_app as background uvicorn in this container if control_port provided as CLI arg
 def start_pb_control_server(control_port):
